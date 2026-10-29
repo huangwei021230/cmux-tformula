@@ -1,0 +1,847 @@
+import type {
+  CellMetrics,
+  FormulaPlacementPlan,
+  FormulaWrapSegment,
+  RenderedFormula,
+  TerminalCapabilities
+} from "./types.js";
+import { calculateFormulaGeometry } from "./geometry.js";
+import { FormulaCache, formulaCacheKey, sharedFormulaCache } from "./formula-cache.js";
+import { mathRendererConfig } from "./math-renderer-config.js";
+import { rasterizeSvgIsolated, RasterWorkerError } from "./resvg-client.js";
+import { WeightedLruCache } from "./weighted-lru-cache.js";
+
+interface MathJaxApi {
+  init(config: Record<string, unknown>): Promise<MathJaxApi>;
+  tex2mmlPromise(tex: string, options: Record<string, unknown>): Promise<string>;
+  tex2svgPromise(tex: string, options: Record<string, unknown>): Promise<unknown>;
+  startup: {
+    adaptor: {
+      tags(node: unknown, name: string): unknown[];
+      serializeXML(node: unknown): string;
+    };
+  };
+}
+
+interface SvgDimensions {
+  aspectRatio: number;
+  heightEx: number;
+  depthEx: number;
+}
+
+export type MathRenderFailureCode =
+  | "input-too-long"
+  | "disabled-command"
+  | "tex-error"
+  | "invalid-svg"
+  // Typesetting never reached a verdict on the source: the MathJax module
+  // failed to load, or the engine itself threw. Kept distinct from tex-error
+  // so callers can treat that code as a property of the LaTeX alone.
+  | "renderer-unavailable"
+  | "raster-limit"
+  | "empty-raster"
+  | "png-limit"
+  | "raster-error";
+
+export class MathRenderError extends Error {
+  constructor(readonly code: MathRenderFailureCode, message: string) {
+    super(message);
+    this.name = "MathRenderError";
+  }
+}
+
+let mathJaxPromise: Promise<MathJaxApi> | undefined;
+const MATHJAX_CACHE_VERSION = "mathjax-4.1.3-scientific-svg-v6";
+const PNG_CACHE_VERSION = "resvg-2.6.2-terminal-canvas-v7";
+const CANONICAL_CONTAINER_WIDTH = 100_000;
+const MATHJAX_EX_PX = 8;
+export const MAX_FORMULA_LENGTH = 20_000;
+const MAX_MACRO_SUBSTITUTIONS = 1_000;
+// Full-width overlays on Retina/5K terminals can exceed 4096 pixels.
+// Permit wide, shallow canvases while preserving the former total pixel budget.
+const MAX_RASTER_DIMENSION = 8_192;
+const MAX_RASTER_PIXELS = 4_096 * 4_096;
+const MAX_PNG_BYTES = 12 * 1024 * 1024;
+const MAX_RENDERED_MEMORY_BYTES = 64 * 1024 * 1024;
+const renderFailureCache = new WeightedLruCache<MathRenderError>(256, 1024 * 1024);
+
+/**
+ * A deterministic, local-only package profile for formulas emitted by
+ * scientific agents. Keep external-resource and HTML packages out of this
+ * list; safeLatex() independently rejects their commands before MathJax sees
+ * them.
+ */
+export const SCIENTIFIC_TEX_PACKAGES = [
+  "mhchem",
+  "physics",
+  "mathtools",
+  "cancel",
+  "centernot",
+  "upgreek",
+  "units",
+  "gensymb",
+  "cases",
+  "extpfeil",
+  "boldsymbol",
+  "enclose",
+  "configmacros"
+] as const;
+
+/** A conservative subset of ubiquitous siunitx syntax used by CLI agents. */
+const SCIENTIFIC_TEX_MACROS: Record<string, string | [string, number]> = {
+  SI: ["#1\\,\\mathrm{#2}", 2],
+  si: ["\\mathrm{#1}", 1],
+  unit: ["\\mathrm{#1}", 1],
+  metre: "\\mathrm{m}",
+  meter: "\\mathrm{m}",
+  second: "\\mathrm{s}",
+  minute: "\\mathrm{min}",
+  hour: "\\mathrm{h}",
+  day: "\\mathrm{d}",
+  gram: "\\mathrm{g}",
+  kilogram: "\\mathrm{kg}",
+  mole: "\\mathrm{mol}",
+  kelvin: "\\mathrm{K}",
+  ampere: "\\mathrm{A}",
+  candela: "\\mathrm{cd}",
+  litre: "\\mathrm{L}",
+  liter: "\\mathrm{L}",
+  hertz: "\\mathrm{Hz}",
+  newton: "\\mathrm{N}",
+  pascal: "\\mathrm{Pa}",
+  joule: "\\mathrm{J}",
+  watt: "\\mathrm{W}",
+  coulomb: "\\mathrm{C}",
+  volt: "\\mathrm{V}",
+  farad: "\\mathrm{F}",
+  tesla: "\\mathrm{T}",
+  weber: "\\mathrm{Wb}",
+  henry: "\\mathrm{H}",
+  siemens: "\\mathrm{S}",
+  lumen: "\\mathrm{lm}",
+  lux: "\\mathrm{lx}",
+  becquerel: "\\mathrm{Bq}",
+  gray: "\\mathrm{Gy}",
+  sievert: "\\mathrm{Sv}",
+  katal: "\\mathrm{kat}",
+  electronvolt: "\\mathrm{eV}",
+  radian: "\\mathrm{rad}",
+  steradian: "\\mathrm{sr}",
+  milli: "\\mathrm{m}",
+  nano: "\\mathrm{n}",
+  pico: "\\mathrm{p}",
+  kilo: "\\mathrm{k}",
+  mega: "\\mathrm{M}",
+  giga: "\\mathrm{G}",
+  tera: "\\mathrm{T}",
+  percent: "\\%",
+  degreeCelsius: "{}^{\\circ}\\mathrm{C}",
+  ohm: "\\Omega",
+  per: "/",
+  squared: "^{2}",
+  cubed: "^{3}"
+};
+
+function normalizedContainerWidth(display: boolean, containerWidth: number): number {
+  if (!display) return CANONICAL_CONTAINER_WIDTH;
+  return Number.isFinite(containerWidth) && containerWidth > 0
+    ? Math.max(1, Math.round(containerWidth))
+    : CANONICAL_CONTAINER_WIDTH;
+}
+
+function mathJaxCacheRequest(
+  latex: string,
+  display: boolean,
+  containerWidth: number
+): { source: string; svgKey: string; containerWidth: number } {
+  // TeX whitespace is usually insignificant, but a trailing space can be the
+  // operand of the control-space command (`\\ `). Preserve the source exactly.
+  const source = safeLatex(normalizeLatexForRendering(latex));
+  const effectiveContainerWidth = normalizedContainerWidth(display, containerWidth);
+  return {
+    source,
+    containerWidth: effectiveContainerWidth,
+    svgKey: formulaCacheKey({
+      version: MATHJAX_CACHE_VERSION,
+      config: mathRendererConfig.fingerprint,
+      source,
+      display,
+      em: 16,
+      ex: 8,
+      containerWidth: effectiveContainerWidth,
+      fontCache: "local",
+      displayOverflow: "linebreak",
+      inlineLinebreaks: false
+    })
+  };
+}
+
+async function getMathJax(): Promise<MathJaxApi> {
+  if (!mathJaxPromise) {
+    mathJaxPromise = import("@mathjax/src").then(async (module) => {
+      const mathJax = module.default as unknown as MathJaxApi;
+      await mathJax.init({
+        loader: {
+          load: [
+            "input/tex",
+            // input/tex preloads configmacros; asking the loader to fetch it
+            // again emits a spurious component-version warning in MathJax 4.
+            ...SCIENTIFIC_TEX_PACKAGES
+              .filter((name) => name !== "configmacros")
+              .map((name) => `[tex]/${name}`),
+            "output/svg"
+          ]
+        },
+        tex: {
+          maxBuffer: MAX_FORMULA_LENGTH,
+          maxMacros: MAX_MACRO_SUBSTITUTIONS,
+          packages: { "[+]": [...SCIENTIFIC_TEX_PACKAGES] },
+          macros: { ...SCIENTIFIC_TEX_MACROS, ...mathRendererConfig.macros },
+          environments: mathRendererConfig.environments
+        },
+        svg: {
+          fontCache: "local",
+          displayOverflow: "linebreak",
+          linebreaks: { inline: false }
+        }
+      });
+      return mathJax;
+    });
+  }
+  return mathJaxPromise;
+}
+
+function parseLength(value: string | undefined): { value: number; unit: string } | undefined {
+  const match = value?.match(/^((?:\d+(?:\.\d*)?|\.\d+))(ex|em|px)?$/u);
+  if (!match) return undefined;
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) && parsed > 0
+    ? { value: parsed, unit: match[2] ?? "px" }
+    : undefined;
+}
+
+export function readSvgDimensions(svg: string): SvgDimensions {
+  const width = parseLength(svg.match(/\bwidth="([^"]+)"/u)?.[1]);
+  const height = parseLength(svg.match(/\bheight="([^"]+)"/u)?.[1]);
+  const viewBox = svg.match(/\bviewBox="[^\s]+\s+[^\s]+\s+([\d.]+)\s+([\d.]+)"/u);
+  const viewBoxRatio = viewBox ? Number(viewBox[1]) / Number(viewBox[2]) : 1;
+  const fallbackRatio = Number.isFinite(viewBoxRatio) && viewBoxRatio > 0 ? viewBoxRatio : 1;
+
+  const unitToEx = (length: { value: number; unit: string }): number => {
+    if (length.unit === "ex") return length.value;
+    if (length.unit === "em") return length.value * 2;
+    return length.value / 8;
+  };
+  const parsedHeightEx = height
+    ? unitToEx(height)
+    : width
+      ? unitToEx(width) / fallbackRatio
+      : 1.8;
+  const parsedWidthEx = width
+    ? unitToEx(width)
+    : parsedHeightEx * fallbackRatio;
+  const verticalAlign = svg.match(/vertical-align:\s*(-?[\d.]+)(ex|em|px)?/u);
+  const parsedVerticalAlignEx = verticalAlign
+    ? unitToEx({ value: Number(verticalAlign[1]), unit: verticalAlign[2] ?? "px" })
+    : 0;
+  const verticalAlignEx = Number.isFinite(parsedVerticalAlignEx) ? parsedVerticalAlignEx : 0;
+  const aspectRatio = parsedWidthEx / parsedHeightEx;
+  return {
+    aspectRatio: Number.isFinite(aspectRatio) && aspectRatio > 0 ? aspectRatio : fallbackRatio,
+    heightEx: Number.isFinite(parsedHeightEx) && parsedHeightEx > 0 ? parsedHeightEx : 1.8,
+    depthEx: Math.max(0, -verticalAlignEx)
+  };
+}
+
+function safeLatex(latex: string): string {
+  if (latex.length > MAX_FORMULA_LENGTH) {
+    throw new MathRenderError(
+      "input-too-long",
+      `formula exceeds the ${MAX_FORMULA_LENGTH} character limit`
+    );
+  }
+  if (/\\(?:require|href|url|html|class|cssId|style|includegraphics|input|include|usepackage|documentclass)\b/iu.test(latex)) {
+    throw new MathRenderError("disabled-command", "formula contains a disabled command");
+  }
+  return latex;
+}
+
+function assertValidMathJaxSvg(svg: string): void {
+  const redErrorText = /<g\b(?=[^>]*\bdata-mml-node=["']mtext["'])(?=[^>]*\bfill=["']red["'])(?=[^>]*\bstroke=["']red["'])[^>]*>/iu;
+  const decodeAttribute = (value: string | undefined): string | undefined => value
+    ?.replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&");
+  const parseError = decodeAttribute(
+    svg.match(/\bdata-mjx-error\s*=\s*(["'])(.*?)\1/iu)?.[2]
+  );
+  if (parseError) {
+    throw new MathRenderError("tex-error", `MathJax could not parse the formula: ${parseError}`);
+  }
+  const redErrorTag = svg.match(redErrorText)?.[0];
+  if (redErrorTag) {
+    const command = decodeAttribute(
+      redErrorTag.match(/\bdata-latex\s*=\s*(["'])(.*?)\1/iu)?.[2]
+    );
+    throw new MathRenderError(
+      "tex-error",
+      `MathJax could not parse the formula${command ? `: unsupported ${command}` : ""}`
+    );
+  }
+  if (/\bdata-mml-node=["']merror["']|<merror\b/iu.test(svg)) {
+    throw new MathRenderError("tex-error", "MathJax could not parse the formula");
+  }
+  const dimensions = readSvgDimensions(svg);
+  if (!/^<svg\b/iu.test(svg)
+    || !/\bwidth=["'][^"']+["']/iu.test(svg)
+    || !/\bheight=["'][^"']+["']/iu.test(svg)
+    || !/\bviewBox=["'][^"']+["']/iu.test(svg)
+    || !/\bdata-mml-node=["']math["']/iu.test(svg)
+    || !Number.isFinite(dimensions.aspectRatio)
+    || dimensions.aspectRatio <= 0
+    || !Number.isFinite(dimensions.heightEx)
+    || dimensions.heightEx <= 0) {
+    throw new MathRenderError("invalid-svg", "MathJax produced an incomplete SVG");
+  }
+}
+
+interface BracedGroup {
+  end: number;
+  source: string;
+}
+
+function bracedGroupAt(source: string, start: number): BracedGroup | undefined {
+  if (source[start] !== "{") return undefined;
+  let depth = 0;
+  for (let index = start; index < source.length; index += 1) {
+    if (source[index] === "\\") {
+      index += 1;
+      continue;
+    }
+    if (source[index] === "{") depth += 1;
+    else if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return { end: index + 1, source: source.slice(start, index + 1) };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * siunitx v3 reuses `\qty`, which is also defined by the physics package.
+ * Only its unambiguous two-braced-argument form is rewritten; physics forms
+ * such as `\qty(x)` and `\qty{\frac{a}{b}}` remain byte-for-byte unchanged.
+ */
+function normalizeSiunitxQuantities(latex: string): string {
+  let output = "";
+  let cursor = 0;
+  const commands = latex.matchAll(/\\qty(?![A-Za-z])/gu);
+  for (const match of commands) {
+    const start = match.index!;
+    if (start < cursor) continue;
+    let argumentStart = start + match[0].length;
+    while (/\s/u.test(latex[argumentStart] ?? "")) argumentStart += 1;
+    const value = bracedGroupAt(latex, argumentStart);
+    if (!value) continue;
+    let unitStart = value.end;
+    while (/\s/u.test(latex[unitStart] ?? "")) unitStart += 1;
+    const unit = bracedGroupAt(latex, unitStart);
+    if (!unit) continue;
+    output += `${latex.slice(cursor, start)}\\SI${value.source}${unit.source}`;
+    cursor = unit.end;
+  }
+  return cursor === 0 ? latex : output + latex.slice(cursor);
+}
+
+export function normalizeLatexForRendering(latex: string): string {
+  // Rendering must not algebraically rewrite valid TeX. In particular,
+  // changing x^1/\sqrt{y} into x^\frac{1}{\sqrt{y}} changes its meaning.
+  // `\textcircled` is a presentational LaTeX command which MathJax 4 does not
+  // implement. Map its simple form to MathJax's equivalent enclosure while
+  // preserving the enclosed expression exactly.
+  return normalizeSiunitxQuantities(latex)
+    .replace(
+      /\\text\s*\{\s*\\textcircled\s*\{([^{}]*)\}\s*\}/gu,
+      (_match, contents: string) => `\\enclose{circle}{${contents}}`
+    )
+    .replace(
+      /\\textcircled\s*\{([^{}]*)\}/gu,
+      (_match, contents: string) => `\\enclose{circle}{${contents}}`
+    );
+}
+
+function escapeAttribute(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;");
+}
+
+function resizeNestedSvg(svg: string, x: number, y: number, width: number, height: number): string {
+  return svg.replace(/^<svg\b([^>]*)>/u, (_all, attributes: string) => {
+    const cleaned = attributes
+      .replace(/\s(?:width|height|x|y|style)="[^"]*"/gu, "")
+      .replace(/\sxmlns="[^"]*"/u, "");
+    return `<svg x="${x}" y="${y}" width="${width}" height="${height}"${cleaned}>`;
+  });
+}
+
+function svgNeedsSystemFonts(svg: string): boolean {
+  // MathJax normally emits every glyph as an SVG path. Resvg otherwise scans
+  // the complete system font collection for every formula, even though those
+  // fonts cannot affect path-only output. Keep font loading for MathJax's
+  // fallback <text> nodes (for example CJK text that is not in its SVG font).
+  return /<(?:[A-Za-z_][\w.-]*:)?text(?=[\s/>])/iu.test(svg);
+}
+
+function sharedContentId(content: string): string {
+  const prefix = "tformula-sliced-content";
+  let id = prefix;
+  let suffix = 0;
+  while (content.includes(`id="${id}"`) || content.includes(`id='${id}'`)) {
+    suffix += 1;
+    id = `${prefix}-${suffix}`;
+  }
+  return id;
+}
+
+function buildHorizontallySlicedSvg(options: {
+  canvasWidth: number;
+  canvasHeight: number;
+  wrapSegments: FormulaWrapSegment[];
+  cell: CellMetrics;
+  background: string;
+  content: string;
+}): string {
+  const contentId = sharedContentId(options.content);
+  const reference = `<use href="#${contentId}"/>`;
+  return [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${options.canvasWidth}" height="${options.canvasHeight}" viewBox="0 0 ${options.canvasWidth} ${options.canvasHeight}">`,
+    `<defs><g id="${contentId}">${options.content}</g></defs>`,
+    ...options.wrapSegments.map((segment) => {
+      const destinationX = segment.startCol * options.cell.width;
+      const destinationY = segment.rowOffset * options.cell.height;
+      const sourceX = segment.logicalStartCol * options.cell.width;
+      const width = (segment.endCol - segment.startCol) * options.cell.width;
+      return [
+        `<svg x="${destinationX}" y="${destinationY}" width="${width}" height="${options.cell.height}" viewBox="${sourceX} 0 ${width} ${options.cell.height}" overflow="hidden">`,
+        `<rect x="${sourceX}" width="${width}" height="${options.cell.height}" fill="${escapeAttribute(options.background)}"/>`,
+        reference,
+        "</svg>"
+      ].join("");
+    }),
+    "</svg>"
+  ].join("");
+}
+
+function buildSourceMaskedSvg(options: {
+  canvasWidth: number;
+  canvasHeight: number;
+  sourceSegments: FormulaWrapSegment[];
+  cell: CellMetrics;
+  background: string;
+  content: string;
+}): string {
+  return [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${options.canvasWidth}" height="${options.canvasHeight}" viewBox="0 0 ${options.canvasWidth} ${options.canvasHeight}">`,
+    ...options.sourceSegments.map((segment) => {
+      const x = segment.startCol * options.cell.width;
+      const y = segment.rowOffset * options.cell.height;
+      const width = (segment.endCol - segment.startCol) * options.cell.width;
+      return `<rect x="${x}" y="${y}" width="${width}" height="${options.cell.height}" fill="${escapeAttribute(options.background)}"/>`;
+    }),
+    options.content,
+    "</svg>"
+  ].join("");
+}
+
+function lruCacheGet<Key, Value>(cache: Map<Key, Value>, key: Key): Value | undefined {
+  const value = cache.get(key);
+  if (value === undefined) return undefined;
+  cache.delete(key);
+  cache.set(key, value);
+  return value;
+}
+
+interface FormulaInkBounds {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+function alphaBounds(pixels: Buffer, width: number, height: number): FormulaInkBounds | undefined {
+  let left = width;
+  let top = height;
+  let right = -1;
+  let bottom = -1;
+  for (let offset = 3, pixel = 0; offset < pixels.length; offset += 4, pixel += 1) {
+    if (pixels[offset] === 0) continue;
+    const x = pixel % width;
+    const y = Math.floor(pixel / width);
+    left = Math.min(left, x);
+    top = Math.min(top, y);
+    right = Math.max(right, x);
+    bottom = Math.max(bottom, y);
+  }
+  return right < 0 ? undefined : { left, top, right: right + 1, bottom: bottom + 1 };
+}
+
+async function renderSvgToPng(
+  svg: string,
+  loadSystemFonts: boolean,
+  fontFiles = mathRendererConfig.fontFiles
+): Promise<Buffer> {
+  try {
+    return await rasterizeSvgIsolated({
+      svg,
+      loadSystemFonts,
+      ...(fontFiles ? { fontFiles } : {}),
+      maxDimension: MAX_RASTER_DIMENSION,
+      maxPixels: MAX_RASTER_PIXELS,
+      maxPngBytes: MAX_PNG_BYTES
+    });
+  } catch (error) {
+    if (error instanceof RasterWorkerError) {
+      throw new MathRenderError(error.code, error.message);
+    }
+    throw new MathRenderError(
+      "raster-error",
+      `formula rasterization failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+export async function renderMathJaxSvg(
+  latex: string,
+  display: boolean,
+  containerWidth: number,
+  cache: FormulaCache = sharedFormulaCache
+): Promise<string> {
+  const request = mathJaxCacheRequest(latex, display, containerWidth);
+  const failed = renderFailureCache.get(request.svgKey);
+  if (failed) throw new MathRenderError(failed.code, failed.message);
+
+  const create = async (): Promise<string> => {
+    try {
+      const mathJax = await getMathJax();
+      const node = await mathJax.tex2svgPromise(request.source, {
+        display,
+        em: 16,
+        ex: 8,
+        containerWidth: request.containerWidth
+      });
+      const adaptor = mathJax.startup.adaptor;
+      const svgNode = adaptor.tags(node, "svg")[0];
+      // A typeset that returns no <svg> root is a misbuilt engine, not a
+      // miswritten formula: output/svg missing from the loader, or an adaptor
+      // that does not match the output jax. Raise it as a plain Error so the
+      // catch below classifies it with the other engine faults. Naming it
+      // invalid-svg would put it on SOURCE_DETERMINED_RENDER_FAILURES, which
+      // retires the LaTeX for the whole session on the first occurrence.
+      if (!svgNode) {
+        throw new Error(
+          "the engine returned a node with no <svg> root; output/svg may be missing or the adaptor mismatched"
+        );
+      }
+      const serialized = adaptor.serializeXML(svgNode);
+      assertValidMathJaxSvg(serialized);
+      return serialized;
+    } catch (error) {
+      if (error instanceof MathRenderError) throw error;
+      // Everything the source can be blamed for is already a MathRenderError
+      // by this point: safeLatex() classifies the input and
+      // assertValidMathJaxSvg() classifies the output. What is left is the
+      // engine failing to run at all — a rejected `import("@mathjax/src")`, a
+      // RangeError out of tex2svgPromise under memory pressure, or a typeset
+      // that hands back no <svg> root. Those say nothing about the formula and
+      // can succeed on the next attempt, so they must not carry a source
+      // verdict's code.
+      throw new MathRenderError(
+        "renderer-unavailable",
+        `the MathJax renderer failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  };
+
+  try {
+    const svg = await cache.getOrCreateSvg(request.svgKey, create);
+    // Validate cache hits too. MathJax also represents unknown commands as red
+    // mtext rather than merror. Incomplete but well-formed SVG roots must not
+    // persist as blank formula images either. Since newly-created output was
+    // already checked above, a failure here is necessarily a stale cache hit;
+    // delete it and repair the request immediately.
+    try {
+      assertValidMathJaxSvg(svg);
+      return svg;
+    } catch {
+      await cache.deleteSvg(request.svgKey);
+      const repaired = await cache.getOrCreateSvg(request.svgKey, create);
+      try {
+        assertValidMathJaxSvg(repaired);
+        return repaired;
+      } catch {
+        // create() validates before it returns, so a value that fails here
+        // cannot have come from it: the disk cache is shared between
+        // processes, and a peer restored the same bad entry between the delete
+        // and the read. That is a cache-coherence fault, not a verdict on the
+        // source, and reporting it as one would retire a formula that typesets
+        // perfectly well. Typeset directly instead, letting create() throw the
+        // true failure code if the source really is at fault.
+        return await create();
+      }
+    }
+  } catch (error) {
+    // renderer-unavailable means typesetting never reached a verdict on the
+    // source. Caching it would answer every later attempt from the cache
+    // without running the engine, so the retry ladder it was deliberately
+    // left on could never reach the engine again for this key.
+    if (error instanceof MathRenderError && error.code !== "renderer-unavailable") {
+      renderFailureCache.set(request.svgKey, error, error.message.length * 2 + 64);
+    }
+    throw error;
+  }
+}
+
+export async function renderMathJaxMathMl(
+  latex: string,
+  display: boolean
+): Promise<string> {
+  const source = safeLatex(normalizeLatexForRendering(latex));
+  const mathJax = await getMathJax();
+  const mathml = await mathJax.tex2mmlPromise(source, { display });
+  if (typeof mathml !== "string"
+    || !/^<math\b/iu.test(mathml)
+    || /<merror\b|\bdata-mjx-error\s*=/iu.test(mathml)) {
+    throw new Error("MathJax could not convert the formula to MathML");
+  }
+  return mathml;
+}
+
+interface PlacementGeometry {
+  columns: number;
+  rows: number;
+  display: boolean;
+  wrapSegments: FormulaPlacementPlan["formulaSlices"] | undefined;
+  logicalColumns: number;
+  horizontallySliced: boolean;
+  tightInline: boolean;
+}
+
+function placementGeometry(plan: FormulaPlacementPlan): PlacementGeometry {
+  const columns = Math.max(1, plan.canvas.endCol - plan.canvas.startCol);
+  const rows = Math.max(1, plan.canvas.endRow - plan.canvas.startRow + 1);
+  const display = plan.formula.intent !== "inline";
+  const wrapSegments = plan.formulaSlices.length ? plan.formulaSlices : undefined;
+  const segmentLogicalColumns = wrapSegments
+    ? Math.max(...wrapSegments.map((segment) =>
+      segment.logicalStartCol + segment.endCol - segment.startCol
+    ))
+    : 0;
+  const logicalColumns = plan.displayRange
+    ? Math.max(1, plan.displayRange.endCol - plan.displayRange.startCol)
+    : wrapSegments
+    ? Math.max(1, segmentLogicalColumns)
+    : columns;
+  return {
+    columns,
+    rows,
+    display,
+    wrapSegments,
+    logicalColumns,
+    horizontallySliced: Boolean(wrapSegments),
+    tightInline: !display
+      && rows === 1
+      && plan.mode === "compact"
+      && plan.sourceMasks.length === 0
+      && !wrapSegments
+      && !plan.displayRange
+  };
+}
+
+/**
+ * The MathJax container width a placement is typeset at, normalized exactly as
+ * the SVG cache key normalizes it. Display formulas that wrap derive it from
+ * the region geometry and scale, so callers that identify a render by its
+ * MathJax inputs need this alongside the source and the display flag.
+ */
+export function mathJaxContainerWidthForPlacement(
+  plan: FormulaPlacementPlan,
+  capabilities: TerminalCapabilities,
+  scale: number
+): number {
+  const { display, rows, horizontallySliced, logicalColumns } = placementGeometry(plan);
+  // A one-row TUI region has no vertical space for MathJax's line boxes and
+  // can become less legible when several lines are compressed back into it.
+  // Multi-row, non-segmented displays can use their reserved height safely.
+  const linebreakDisplay = display && !horizontallySliced && rows > 1;
+  if (!linebreakDisplay) return CANONICAL_CONTAINER_WIDTH;
+  const availableWidthPx = Math.max(
+    1,
+    logicalColumns * capabilities.cell.width - capabilities.cell.width * 2
+  );
+  const targetExPx = capabilities.cell.height * 0.45 * scale;
+  return normalizedContainerWidth(
+    display,
+    Math.max(1, availableWidthPx * MATHJAX_EX_PX / targetExPx)
+  );
+}
+
+export class MathRenderer {
+  readonly #cache = new WeightedLruCache<RenderedFormula>(
+    256,
+    MAX_RENDERED_MEMORY_BYTES
+  );
+
+  constructor(readonly persistentCache: FormulaCache = sharedFormulaCache) {}
+
+  #placementKey(plan: FormulaPlacementPlan, capabilities: TerminalCapabilities,
+    scale: number, foreground: string, background: string): string {
+    const { columns, rows, display, tightInline } = placementGeometry(plan);
+    const { svgKey } = mathJaxCacheRequest(plan.formula.latex, display,
+      mathJaxContainerWidthForPlacement(plan, capabilities, scale));
+    return formulaCacheKey({ version: PNG_CACHE_VERSION, svgKey,
+      intent: plan.formula.intent, display, compact: Boolean(plan.formula.compact),
+      displayRange: plan.displayRange, composite: plan.composite,
+      sourceMasks: plan.sourceMasks, formulaSlices: plan.formulaSlices,
+      mode: plan.mode, tightInline, columns, rows,
+      cell: { width: capabilities.cell.width, height: capabilities.cell.height },
+      scale, foreground, background });
+  }
+
+  cachedPlacement(plan: FormulaPlacementPlan, capabilities: TerminalCapabilities,
+    scale: number, foreground = capabilities.foreground, background = capabilities.background
+  ): RenderedFormula | undefined {
+    return this.#cache.get(this.#placementKey(plan, capabilities, scale, foreground, background));
+  }
+
+  async renderPlacement(
+    plan: FormulaPlacementPlan,
+    capabilities: TerminalCapabilities,
+    scale: number,
+    foreground = capabilities.foreground,
+    background = capabilities.background
+  ): Promise<RenderedFormula> {
+    const {
+      columns,
+      rows,
+      display,
+      wrapSegments,
+      logicalColumns,
+      horizontallySliced,
+      tightInline
+    } = placementGeometry(plan);
+    const mathJaxContainerWidth = mathJaxContainerWidthForPlacement(
+      plan,
+      capabilities,
+      scale
+    );
+    const cacheKey = this.#placementKey(plan, capabilities, scale, foreground, background);
+    const cached = this.#cache.get(cacheKey);
+    if (cached) return cached;
+
+    const formulaSvg = await renderMathJaxSvg(
+      plan.formula.latex,
+      display,
+      mathJaxContainerWidth,
+      this.persistentCache
+    );
+    const dimensions = readSvgDimensions(formulaSvg);
+    const geometry = calculateFormulaGeometry({
+      aspectRatio: dimensions.aspectRatio,
+      naturalHeightEx: dimensions.heightEx,
+      depthEx: dimensions.depthEx,
+      columns: logicalColumns,
+      rows: horizontallySliced ? 1 : rows,
+      cell: capabilities.cell,
+      scale,
+      display: horizontallySliced ? false : display,
+      // Keep inline glyphs close to preceding prose with a stable sub-cell
+      // bearing. The reader already removes adjacent source-space cells, so
+      // integer-column slack can safely remain on the trailing side without
+      // recreating the former doubled gap.
+      leftAlign: !display || Boolean(plan.formula.compact)
+    });
+    const nestedX = geometry.offsetX
+      + (plan.displayRange?.startCol ?? 0) * capabilities.cell.width;
+    const nested = resizeNestedSvg(
+      formulaSvg,
+      tightInline ? 0 : nestedX,
+      tightInline ? 0 : geometry.offsetY,
+      geometry.formulaWidth,
+      geometry.formulaHeight
+    );
+    const content = `<g color="${escapeAttribute(foreground)}" fill="${escapeAttribute(foreground)}">${nested}</g>`;
+    const canvasWidth = Math.max(1, Math.round(columns * capabilities.cell.width));
+    const canvasHeight = Math.max(1, Math.round(rows * capabilities.cell.height));
+    const wrapper = tightInline
+      ? [
+          `<svg xmlns="http://www.w3.org/2000/svg" width="${geometry.formulaWidth}" height="${geometry.formulaHeight}" viewBox="0 0 ${geometry.formulaWidth} ${geometry.formulaHeight}">`,
+          content,
+          "</svg>"
+        ].join("")
+      : wrapSegments
+      ? buildHorizontallySlicedSvg({
+          canvasWidth,
+          canvasHeight,
+          wrapSegments,
+          cell: capabilities.cell,
+          background,
+          content
+        })
+      : plan.sourceMasks.length > 0
+      ? buildSourceMaskedSvg({
+          canvasWidth,
+          canvasHeight,
+          sourceSegments: plan.sourceMasks,
+          cell: capabilities.cell,
+          background,
+          content
+        })
+      : [
+          `<svg xmlns="http://www.w3.org/2000/svg" width="${geometry.canvasWidth}" height="${geometry.canvasHeight}" viewBox="0 0 ${geometry.canvasWidth} ${geometry.canvasHeight}">`,
+          `<rect width="100%" height="100%" fill="${escapeAttribute(background)}"/>`,
+          content,
+          "</svg>"
+        ].join("");
+    const png = await this.persistentCache.getOrCreatePng(cacheKey, () =>
+      renderSvgToPng(
+        wrapper,
+        mathRendererConfig.loadSystemFonts && svgNeedsSystemFonts(formulaSvg),
+        mathRendererConfig.fontFiles
+      )
+    );
+    const rendered: RenderedFormula = {
+      png,
+      cacheKey,
+      columns,
+      rows,
+      widthPx: tightInline ? geometry.formulaWidth : canvasWidth,
+      heightPx: tightInline ? geometry.formulaHeight : canvasHeight,
+      ...(tightInline ? {
+        pixelPlacement: {
+          offsetX: geometry.offsetX,
+          offsetY: geometry.offsetY
+        }
+      } : {}),
+      fitScale: geometry.fitScale,
+      naturalAspectRatio: dimensions.aspectRatio,
+      naturalHeightEx: dimensions.heightEx
+    };
+    this.#cache.set(cacheKey, rendered, png.byteLength + 256);
+    return rendered;
+  }
+
+  clear(): void {
+    this.#cache.clear();
+    renderFailureCache.clear();
+  }
+}
+
+export const mathRendererInternals = {
+  alphaBounds,
+  buildHorizontallySlicedSvg,
+  buildSourceMaskedSvg,
+  lruCacheGet,
+  renderSvgToPng,
+  svgNeedsSystemFonts
+};

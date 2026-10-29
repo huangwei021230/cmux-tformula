@@ -1,0 +1,19 @@
+#!/bin/sh
+# Child shells receive TFORMULA_ACTIVE=1 from TFormula, which prevents recursive startup.
+export SHELL="${SHELL:-/bin/zsh}"
+if [ "${CMUX_FORMULA_DISABLE:-}" = 1 ] || [ "${TFORMULA_ACTIVE:-}" = 1 ]; then
+  exec "$SHELL" -l
+fi
+tformula_bin="${TFORMULA_BIN:-tformula}"
+set --
+if [ "${CMUX_FORMULA_DEBUG:-}" = 1 ]; then
+  set -- --debug
+fi
+"$tformula_bin" "$@" --shell
+formula_status=$?
+if [ "$formula_status" -ne 0 ]; then
+  printf '\nTFormula exited (%s); opening a plain shell.\n' "$formula_status" >&2
+  export CMUX_FORMULA_DISABLE=1
+  exec "$SHELL" -l
+fi
+exit 0

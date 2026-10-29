@@ -1,0 +1,1699 @@
+diff --git a/README.md b/README.md
+index 9433144..82f1ac6 100644
+--- a/README.md
++++ b/README.md
+@@ -261,6 +261,39 @@ tformula codex
+ 
+ ## Formula sizing
+ 
++### Transparent cmux backgrounds (local integration)
++
++`TFORMULA_TRANSPARENT=1` renders alpha PNGs and conceals the underlying source
++glyphs using terminal attributes, retaining their original copyable characters.
++The installed cmux launcher enables this mode by default. Rejected images and
++removed formulas restore visible source; subsequent input keeps its normal style.
++The startup cursor is queried so login banners do not offset formula coordinates.
++When positioning or unusual styling cannot be reproduced reliably, legacy opaque
++masks remain the fallback. Normal-buffer images remain with terminal scrollback.
++Set `TFORMULA_TRANSPARENT=0` before restarting the proxy for legacy behavior.
++
++The cmux launcher also defaults to `TFORMULA_STRICT=1`: only explicit math
++delimiters or complete math environments trigger rendering. Plain parentheses,
++identifiers, backtick code spans (including unfinished streamed spans), and code
++fences stay as text. Text following an inline formula is no longer packed into
++its image. If a TUI removes the delimiters, strict mode leaves that text alone.
++
++On synchronized TUI redraws, memory-cached formulas are placed before the
++application releases its frame. SSH/tmux fragments without frame controls are
++joined after a 16 ms quiet period (32 ms maximum, or 64 Ki characters). A pure
++frame-end control also waits for that short tail: tmux can close its frame in
++the middle of a formula and deliver the remainder unframed. Formula
++redraws use a synchronized transaction covering lifecycle deletes as well as
++image placement, so deleting old images cannot prematurely release source text.
++An in-flight render or a new layout gets up to 40 ms to finish before releasing
++the frame; slower work continues asynchronously. This improves scroll redraws
++without waiting indefinitely on typesetting; first-render latency is still possible.
++Run `npm run build && node benchmark/scroll-frames.mjs` to measure frame readiness.
++Set `TFORMULA_SCROLL_FRAGMENTED=1` for the unframed, fragmented redraw benchmark.
++Use `TFORMULA_SCROLL_FRAGMENTED=tmux` to test a frame ending in mid-formula.
++These local changes load in new terminal surfaces; reconnecting an existing SSH
++surface does not restart its outer renderer.
++
+ At startup and after terminal resize events, TFormula queries the terminal for
+ its cell dimensions in pixels. MathJax's natural `ex` dimensions are mapped to
+ the terminal cell height, so an ordinary mathematical symbol has approximately
+@@ -548,7 +581,8 @@ tformula -- claude --resume
+ - Commands that can load or embed external content, including `\require`,
+   `\href`, `\url`, `\includegraphics`, `\input`, `\include`, `\usepackage`,
+   `\documentclass`, and MathJax HTML/style commands, are rejected.
+-- Generated rasters are limited to 4096 × 4096 pixels and 12 MB PNG payloads;
++- Generated rasters are limited to 8192 pixels per side, 4096² total pixels,
++  and 12 MB PNG payloads. Wide Retina terminal overlays fit within this budget;
+   empty rasters are rejected with structured diagnostics. Resvg runs in a
+   restartable isolated process, so a native rasterizer panic cannot terminate
+   the Agent or PTY session.
+diff --git a/README.zh-CN.md b/README.zh-CN.md
+index 938c996..30d042c 100644
+--- a/README.zh-CN.md
++++ b/README.zh-CN.md
+@@ -236,6 +236,31 @@ tformula codex
+ 
+ ## 公式大小
+ 
++### cmux 透明背景（本地适配）
++
++`TFORMULA_TRANSPARENT=1` 使用带透明通道的公式图片，并通过终端的隐藏字形属性遮住
++下方 LaTeX；字符本身保留，可以复制。这里安装的 cmux 启动入口默认启用此模式。
++图片被拒绝或公式被移除时，会恢复对应源码的显示；不会把后续输入设为隐藏。
++启动时会查询真实光标位置，避免登录提示使公式位置偏移。无法可靠获取位置或复现
++特殊字符样式时，使用原来的不透明遮罩。普通缓冲区的公式图片会保留到终端滚动历史中。
++需要原来的行为时，可以设置 `TFORMULA_TRANSPARENT=0` 后重新启动代理。
++
++cmux 启动入口还默认设置 `TFORMULA_STRICT=1`：仅识别明确的公式分隔符或完整数学
++环境。普通括号、变量名、反引号代码（包括流式输出中尚未闭合的代码）和代码围栏
++保持文本；行内公式后的正文不会再被拼入公式图片。如果 TUI 去掉了公式分隔符，
++严格模式会保留其文字，不再猜测。
++
++同步刷新 TUI 时，会在应用结束这一帧之前放置内存缓存中的公式图片。SSH/tmux
++没有帧控制的分段输出在安静 16 ms 后合并，最多等待 32 ms，或达到 64 Ki 字符即释放。
++单独结束同步帧的指令也等待这个短尾段，因为 tmux 有时在公式中途结束帧，随后才送达剩余内容。
++公式重绘的同步事务覆盖旧图片清理到新图片放置的全过程，避免清理图片时提前显示源码。
++正在进行的排版或新布局最多等待 40 ms 加入当前帧，超过时间的任务继续异步完成。
++这能改善滚动重绘时的闪烁，但不能消除首次渲染延迟。
++可用 `npm run build && node benchmark/scroll-frames.mjs` 测量帧结束前图片是否就绪。
++设置 `TFORMULA_SCROLL_FRAGMENTED=1` 可以测试无帧控制的分段重绘。
++设置为 `tmux` 则测试在公式中途结束同步帧的情况。
++本地改动在新建终端面板中加载；对现有 SSH 面板执行重连不会重启外层渲染器。
++
+ TFormula 会在启动时以及终端尺寸变化后查询单元格的像素尺寸，再把 MathJax
+ 公式的自然 `ex` 高度映射到终端文字高度。因此普通数学符号会与周围文字大小
+ 接近，而分式、求和与导数仍保留自然的上下结构。
+@@ -467,7 +492,8 @@ tformula -- opencode --continue
+ - 禁止 `\require`、`\href`、`\url`、`\includegraphics`、`\input`、
+   `\include`、`\usepackage`、`\documentclass` 以及 MathJax HTML/样式命令等
+   可能加载外部内容的命令。
+-- 生成的栅格最大为 4096 × 4096 像素，PNG 最大为 12 MB；空栅格会以结构化错误拒绝。
++- 生成的栅格单边最多 8192 像素、总像素最多 4096²，支持 Retina 宽屏终端的横向覆盖层。
++  PNG 最大为 12 MB；空栅格会以结构化错误拒绝，尺寸限制在分配栅格前检查。
+   Resvg 在可重启的隔离进程中运行，因此原生栅格器 panic 不会终止 Agent 或 PTY 会话。
+ - 解析或渲染失败时保留原始 LaTeX，不阻断 Agent。
+ - 渲染遵循源码不变原则：TFormula 不会用图片替换子程序文本，公式图片是独立覆盖层；
+diff --git a/src/detect.ts b/src/detect.ts
+index a078b68..ff34f05 100644
+--- a/src/detect.ts
++++ b/src/detect.ts
+@@ -567,7 +567,7 @@ function markdownFence(line: string): { marker: "`" | "~"; length: number; closi
+   };
+ }
+ 
+-function detectionLineContexts(lines: string[]): DetectionLineContext[] {
++function detectionLineContexts(lines: string[], conservativeCode = false): DetectionLineContext[] {
+   const contexts: DetectionLineContext[] = [];
+   let codeFence: { marker: "`" | "~"; length: number } | undefined;
+   let htmlVerbatim: HtmlVerbatimKind | undefined;
+@@ -603,6 +603,53 @@ function detectionLineContexts(lines: string[]): DetectionLineContext[] {
+       ...(commentStart === undefined ? {} : { commentStart })
+     });
+   }
++  if (conservativeCode) {
++    // Match exact backtick runs across hard-wrapped terminal rows. An opening
++    // run still being streamed protects the remainder of its logical row.
++    for (let start = 0; start < lines.length;) {
++      if (contexts[start]!.inCodeFence || !lines[start]!.trim()) { start++; continue; }
++      let end = start;
++      // Inline code cannot carry an unfinished opener into another paragraph.
++      while (end < lines.length && !contexts[end]!.inCodeFence && lines[end]!.trim()) end++;
++      const text = lines.slice(start, end).join("\n");
++      const runs = [...text.matchAll(/`+/gu)].filter((m) => !isEscapedAt(text, m.index));
++      const next = new Map<number, number>();
++      const closers = new Map<number, number>();
++      for (let i = runs.length - 1; i >= 0; i--) {
++        const length = runs[i]![0].length;
++        const closer = next.get(length);
++        if (closer !== undefined) closers.set(i, closer);
++        next.set(length, i);
++      }
++      const ranges: InlineCodeRange[] = [];
++      for (let i = 0; i < runs.length; i++) {
++        const run = runs[i]!;
++        const closer = closers.get(i);
++        if (closer !== undefined) {
++          ranges.push({ start: run.index, end: runs[closer]!.index + run[0].length });
++          i = closer;
++        } else {
++          const newline = text.indexOf("\n", run.index);
++          ranges.push({ start: run.index, end: newline < 0 ? text.length : newline });
++        }
++      }
++      let offset = 0;
++      for (let row = start; row < end; row++) {
++        const limit = offset + lines[row]!.length;
++        contexts[row]!.protectedRanges = mergeProtectedRanges([
++          ...contexts[row]!.protectedRanges,
++          ...ranges.filter((r) => r.start < limit && r.end > offset).map((r) => ({
++            start: Math.max(0, r.start - offset), end: Math.min(limit, r.end) - offset
++          }))
++        ]);
++        const commentStart = texCommentStart(lines[row]!, contexts[row]!.protectedRanges);
++        if (commentStart === undefined) delete contexts[row]!.commentStart;
++        else contexts[row]!.commentStart = commentStart;
++        offset = limit + 1;
++      }
++      start = end;
++    }
++  }
+   return contexts;
+ }
+ 
+@@ -1515,13 +1562,13 @@ export function classifyFormulaIntent(
+  * preferred. A conservative inferred form handles TUIs that turn `\[`/`\]`
+  * into bare bracket lines while leaving the TeX body visible.
+  */
+-export function detectFormulas(lines: string[]): DetectedFormula[] {
++export function detectFormulas(lines: string[], options: { strict?: boolean } = {}): DetectedFormula[] {
+   // Every supported explicit delimiter, TeX command, inferred ASCII form, and
+   // Unicode-math form contains at least one of these characters. Most TUI
+   // frames are plain status/log text, so avoid building code-range contexts
+   // and running every detector when a formula is structurally impossible.
+   if (!lines.some(containsFormulaTrigger)) return [];
+-  const contexts = detectionLineContexts(lines);
++  const contexts = detectionLineContexts(lines, options.strict);
+   const pendingRows = pendingDisplayRows(lines, contexts);
+   const rangeIntersectsPendingDisplay = (startRow: number, endRow: number): boolean => {
+     for (let row = startRow; row <= endRow; row += 1) {
+@@ -1545,7 +1592,7 @@ export function detectFormulas(lines: string[]): DetectedFormula[] {
+     ].filter((region) => !intersectsPendingDisplay(region))
+   ];
+ 
+-  for (let row = 0; row < lines.length; row += 1) {
++  for (let row = 0; !options.strict && row < lines.length; row += 1) {
+     const line = lines[row] ?? "";
+     const trimmed = line.trim();
+     const context = contexts[row]!;
+diff --git a/src/math-renderer.ts b/src/math-renderer.ts
+index 3e1635b..24e922c 100644
+--- a/src/math-renderer.ts
++++ b/src/math-renderer.ts
+@@ -57,7 +57,10 @@ const CANONICAL_CONTAINER_WIDTH = 100_000;
+ const MATHJAX_EX_PX = 8;
+ export const MAX_FORMULA_LENGTH = 20_000;
+ const MAX_MACRO_SUBSTITUTIONS = 1_000;
+-const MAX_RASTER_DIMENSION = 4_096;
++// Full-width overlays on Retina/5K terminals can exceed 4096 pixels.
++// Permit wide, shallow canvases while preserving the former total pixel budget.
++const MAX_RASTER_DIMENSION = 8_192;
++const MAX_RASTER_PIXELS = 4_096 * 4_096;
+ const MAX_PNG_BYTES = 12 * 1024 * 1024;
+ const MAX_RENDERED_MEMORY_BYTES = 64 * 1024 * 1024;
+ const renderFailureCache = new WeightedLruCache<MathRenderError>(256, 1024 * 1024);
+@@ -494,6 +497,7 @@ async function renderSvgToPng(
+       loadSystemFonts,
+       ...(fontFiles ? { fontFiles } : {}),
+       maxDimension: MAX_RASTER_DIMENSION,
++      maxPixels: MAX_RASTER_PIXELS,
+       maxPngBytes: MAX_PNG_BYTES
+     });
+   } catch (error) {
+@@ -690,6 +694,26 @@ export class MathRenderer {
+ 
+   constructor(readonly persistentCache: FormulaCache = sharedFormulaCache) {}
+ 
++  #placementKey(plan: FormulaPlacementPlan, capabilities: TerminalCapabilities,
++    scale: number, foreground: string, background: string): string {
++    const { columns, rows, display, tightInline } = placementGeometry(plan);
++    const { svgKey } = mathJaxCacheRequest(plan.formula.latex, display,
++      mathJaxContainerWidthForPlacement(plan, capabilities, scale));
++    return formulaCacheKey({ version: PNG_CACHE_VERSION, svgKey,
++      intent: plan.formula.intent, display, compact: Boolean(plan.formula.compact),
++      displayRange: plan.displayRange, composite: plan.composite,
++      sourceMasks: plan.sourceMasks, formulaSlices: plan.formulaSlices,
++      mode: plan.mode, tightInline, columns, rows,
++      cell: { width: capabilities.cell.width, height: capabilities.cell.height },
++      scale, foreground, background });
++  }
++
++  cachedPlacement(plan: FormulaPlacementPlan, capabilities: TerminalCapabilities,
++    scale: number, foreground = capabilities.foreground, background = capabilities.background
++  ): RenderedFormula | undefined {
++    return this.#cache.get(this.#placementKey(plan, capabilities, scale, foreground, background));
++  }
++
+   async renderPlacement(
+     plan: FormulaPlacementPlan,
+     capabilities: TerminalCapabilities,
+@@ -711,30 +735,7 @@ export class MathRenderer {
+       capabilities,
+       scale
+     );
+-    const { svgKey } = mathJaxCacheRequest(
+-      plan.formula.latex,
+-      display,
+-      mathJaxContainerWidth
+-    );
+-    const cacheKey = formulaCacheKey({
+-      version: PNG_CACHE_VERSION,
+-      svgKey,
+-      intent: plan.formula.intent,
+-      display,
+-      compact: Boolean(plan.formula.compact),
+-      displayRange: plan.displayRange,
+-      composite: plan.composite,
+-      sourceMasks: plan.sourceMasks,
+-      formulaSlices: plan.formulaSlices,
+-      mode: plan.mode,
+-      tightInline,
+-      columns,
+-      rows,
+-      cell: { width: capabilities.cell.width, height: capabilities.cell.height },
+-      scale,
+-      foreground,
+-      background
+-    });
++    const cacheKey = this.#placementKey(plan, capabilities, scale, foreground, background);
+     const cached = this.#cache.get(cacheKey);
+     if (cached) return cached;
+ 
+diff --git a/src/probe.ts b/src/probe.ts
+index a78197f..32bffad 100644
+--- a/src/probe.ts
++++ b/src/probe.ts
+@@ -5,6 +5,7 @@ const DEFAULT_FOREGROUND = "#d8dee9";
+ const DEFAULT_BACKGROUND = "#1e1e2e";
+ 
+ interface ParsedResponses {
++  initialCursor?: { row: number; column: number };
+   cell?: { width: number; height: number };
+   windowPixels?: { width: number; height: number };
+   foreground?: string;
+@@ -130,6 +131,14 @@ export class TerminalProbeResponseFilter {
+           continue;
+         }
+         if (captureDeviceAttributes) {
++          const cursorPosition = body.match(/^\d+;\d+R/u)?.[0];
++          if (cursorPosition) {
++            const end = bodyStart + cursorPosition.length;
++            responses.push(data.slice(start, end));
++            cursor = end;
++            continue;
++          }
++          if (/^\d+(?:;\d*)?$/u.test(body) && hold(start)) break;
+           const deviceAttributes = body.match(/^(?:\?|>)?[0-9;]*c/u)?.[0];
+           if (deviceAttributes) {
+             const end = bodyStart + deviceAttributes.length;
+@@ -219,6 +228,11 @@ export function parseTerminalResponses(input: string): ParsedResponses {
+   let background: string | undefined;
+   let kittyGraphics: boolean | undefined;
+   let primaryDeviceAttributes = false;
++  let initialCursor: ParsedResponses["initialCursor"];
++  residual = residual.replace(/(?:\x1b\[|\u009b)(\d+);(\d+)R/gu, (_all, row, column) => {
++    if (Number(row) > 0 && Number(column) > 0) initialCursor = { row: Number(row), column: Number(column) };
++    return "";
++  });
+ 
+   residual = residual.replace(
+     /(?:\x1b_G|\u009fG)([^;\x1b\u009c]*);([^\x1b\u009c]*)(?:\x1b\\|\u009c)/gu,
+@@ -253,6 +267,7 @@ export function parseTerminalResponses(input: string): ParsedResponses {
+   );
+ 
+   return {
++    initialCursor,
+     cell,
+     windowPixels,
+     foreground,
+@@ -338,7 +353,7 @@ export async function probeTerminal(
+   // graphics response is a definitive negative and prevents raw PNG payloads
+   // from being sent on a false-positive TERM hint.
+   process.stdout.write(
+-    `\x1b[16t\x1b[14t\x1b]10;?\x1b\\\x1b]11;?\x1b\\${fallback.kittyGraphics ? KITTY_GRAPHICS_QUERY : "\x1b[c"}`
++    `\x1b[6n\x1b[16t\x1b[14t\x1b]10;?\x1b\\\x1b]11;?\x1b\\${fallback.kittyGraphics ? KITTY_GRAPHICS_QUERY : "\x1b[c"}`
+   );
+   const timer = setTimeout(() => finishProbe?.(), Math.max(0, timeoutMs));
+   await barrier;
+@@ -364,6 +379,7 @@ export async function probeTerminal(
+   return {
+     capabilities: {
+       ...fallback,
++      initialCursor: parsed.initialCursor,
+       kittyGraphics: confirmedKittyGraphics(fallback.kittyGraphics, parsed.kittyGraphics),
+       foreground: parsed.foreground ?? fallback.foreground,
+       background: parsed.background ?? fallback.background,
+diff --git a/src/proxy.ts b/src/proxy.ts
+index 77f63c7..195dfe7 100644
+--- a/src/proxy.ts
++++ b/src/proxy.ts
+@@ -9,6 +9,7 @@ import { containsFormulaTrigger } from "./detect.js";
+ import { FormulaFocusInput, type FormulaFocusAction } from "./formula-focus.js";
+ import { FormulaHistoryStore } from "./formula-history.js";
+ import { FormulaScreen } from "./screen.js";
++import { TerminalFrameBoundaries, type TerminalFramePart } from "./frame-boundaries.js";
+ import {
+   isGhosttyTerminal,
+   KittyImageTransmitter,
+@@ -33,6 +34,7 @@ import {
+   TerminalOutputTransformer
+ } from "./terminal-output.js";
+ import { TerminalWriter } from "./terminal-writer.js";
++import { OutputCoalescer } from "./output-coalescer.js";
+ import type { CliOptions, TerminalCapabilities } from "./types.js";
+ 
+ function ensureNodePtyHelper(): void {
+@@ -77,6 +79,7 @@ export async function runProxy(
+   let outputQueue = Promise.resolve();
+   const terminalWriter = new TerminalWriter(process.stdout);
+   const childControlGate = new TerminalControlGate();
++  const frameBoundaries = new TerminalFrameBoundaries();
+   const outputTransformer = new TerminalOutputTransformer();
+   const cellHoldback = new TerminalCellHoldback();
+   const ghosttyTerminal = isGhosttyTerminal();
+@@ -119,6 +122,9 @@ export async function runProxy(
+         scale: options.scale,
+         minReadableScale: options.minReadableScale,
+         stabilityMs: options.stabilityMs,
++        strictDetection: process.env.TFORMULA_STRICT === "1",
++        transparentBackground: process.env.TFORMULA_TRANSPARENT === "1"
++          && capabilities.initialCursor !== undefined,
+         writeOuter,
+         writeGraphics: (create) => terminalWriter.writeGenerated(create),
+         debug,
+@@ -506,10 +512,11 @@ export async function runProxy(
+     }
+   });
+ 
+-  const enqueueReleasedChildOutput = (data: string): void => {
+-    if (!data) return;
++  const enqueueFramePart = (part: TerminalFramePart): void => {
++    const { data } = part;
++    if (!data && !part.end) return;
+     if (!screen) {
+-      writeOuter(data);
++      writeOuter(data + (part.end ?? ""));
+       return;
+     }
+     // If the stable screen has no formula state and this burst cannot begin or
+@@ -522,7 +529,8 @@ export async function runProxy(
+     const skipCheckpoints = !formulaOrLayoutTrigger
+       && (plainOutputFastPath || screen.canSkipOutputCheckpoints);
+     plainOutputFastPath = skipCheckpoints;
+-    const slices = skipCheckpoints
++    const slices = skipCheckpoints || part.inFrame || part.end
++      || screen.terminal.buffer.active.type === "alternate"
+       ? [{ data, checkpoint: false }]
+       : outputSplitter.push(data);
+     // Reserve the entire callback before it waits behind outputQueue. This
+@@ -533,7 +541,15 @@ export async function runProxy(
+       for (const slice of slices) {
+         let queued = true;
+         let realCursorCatchupQueued = false;
++        const ownFrame = !part.inFrame && !part.end
++          && !screen.synchronizedOutputMode && capabilities.kittyGraphics
++          && (containsFormulaTrigger(slice.data) || slice.data.includes("\x1b"))
++          && (screen.hasTerminalPlacements || containsFormulaTrigger(slice.data));
+         try {
++          if (ownFrame) {
++            screen.setOutputFrameActive(true);
++            await terminalWriter.write("\x1b[?2026h");
++          }
+           const transformed = outputTransformer.push(
+             slice.data,
+             ghosttyTerminal
+@@ -569,7 +585,7 @@ export async function runProxy(
+             if (screen.pendingWrap) {
+               await screen.flushScanBeforeHeldCell(
+                 held.heldColumns ?? 1,
+-                held.heldSynchronizedOutputMode
++                held.heldSynchronizedOutputMode ?? (ownFrame ? true : undefined)
+               );
+               scannedBeforeHeldCell = true;
+             }
+@@ -577,7 +593,8 @@ export async function runProxy(
+             screen.cancelQueuedWrite();
+             realCursorCatchupQueued = false;
+           }
+-          if (slice.checkpoint && !scannedBeforeHeldCell) await screen.flushScan(true);
++          if (part.end || ownFrame) await screen.flushFrameScan(ownFrame);
++          else if (slice.checkpoint && !scannedBeforeHeldCell) await screen.flushScan(true);
+           if (screen.formulaFocusActive) await screen.refreshFormulaFocus();
+         } catch (error) {
+           // Match the former one-operation-per-slice queue semantics: a bad
+@@ -587,11 +604,46 @@ export async function runProxy(
+         } finally {
+           if (realCursorCatchupQueued) screen.cancelQueuedWrite();
+           if (queued) screen.cancelQueuedWrite();
++          if (part.end) {
++            screen.queueWrite();
++            await terminalWriter.write(part.end);
++            await screen.write(part.end, true);
++          } else if (ownFrame) {
++            try { await terminalWriter.write("\x1b[?2026l"); }
++            finally { screen.setOutputFrameActive(false); }
++          }
+         }
+       }
+     });
+   };
+ 
++  let deferredFrameEnd: string | undefined;
++  const coalescer = new OutputCoalescer((data) => {
++    const end = deferredFrameEnd;
++    deferredFrameEnd = undefined;
++    enqueueFramePart({ data, inFrame: end !== undefined, ...(end ? { end } : {}) });
++    screen?.cancelQueuedWrite();
++  });
++  const enqueueReleasedChildOutput = (data: string): void => {
++    for (const part of frameBoundaries.push(data)) {
++      // tmux may close DEC 2026 in the middle of a formula, then send the rest
++      // unframed milliseconds later. Keep a pure frame end behind that short
++      // tail. Combined mode resets must retain their original ordering.
++      if (part.inFrame && part.end && /^(?:\x1b\[|\u009b)\?2026l$/u.test(part.end)) {
++        coalescer.flush();
++        deferredFrameEnd = part.end;
++        screen?.queueWrite();
++        coalescer.push(part.data, true);
++      } else if (part.inFrame || part.end) {
++        coalescer.flush();
++        enqueueFramePart(part);
++      } else {
++        if (!coalescer.pending) screen?.queueWrite();
++        coalescer.push(part.data);
++      }
++    }
++  };
++
+   child.onData((data) => {
+     observeFirstChildOutput();
+     if (!screen) {
+@@ -669,6 +721,7 @@ export async function runProxy(
+       // a delete/image transaction would recreate the very interleaving this
+       // gate prevents, while leaving it open would corrupt the parent shell.
+       if (screen) enqueueReleasedChildOutput(childControlGate.flush(true));
++      coalescer.flush();
+       void outputQueue.finally(async () => {
+         let finalExitCode = signal ? 128 + signal : exitCode;
+         try {
+diff --git a/src/resvg-client.ts b/src/resvg-client.ts
+index c811b50..258b180 100644
+--- a/src/resvg-client.ts
++++ b/src/resvg-client.ts
+@@ -21,6 +21,7 @@ interface RasterRequest {
+   loadSystemFonts: boolean;
+   fontFiles?: string[];
+   maxDimension: number;
++  maxPixels: number;
+   maxPngBytes: number;
+ }
+ 
+diff --git a/src/resvg-worker.ts b/src/resvg-worker.ts
+index 8854a7f..e95bb8e 100644
+--- a/src/resvg-worker.ts
++++ b/src/resvg-worker.ts
+@@ -1,4 +1,4 @@
+-import { renderAsync } from "@resvg/resvg-js";
++import { Resvg } from "@resvg/resvg-js";
+ 
+ interface RasterRequest {
+   id: number;
+@@ -6,6 +6,7 @@ interface RasterRequest {
+   loadSystemFonts: boolean;
+   fontFiles?: string[];
+   maxDimension: number;
++  maxPixels: number;
+   maxPngBytes: number;
+ }
+ 
+@@ -36,7 +37,7 @@ function send(message: RasterSuccess | RasterFailure): void {
+ process.on("message", async (message: RasterRequest) => {
+   if (!message || !Number.isSafeInteger(message.id) || typeof message.svg !== "string") return;
+   try {
+-    const rendered = await renderAsync(message.svg, {
++    const renderer = new Resvg(message.svg, {
+       fitTo: { mode: "original" },
+       font: {
+         loadSystemFonts: message.loadSystemFonts,
+@@ -46,16 +47,20 @@ process.on("message", async (message: RasterRequest) => {
+       textRendering: 2,
+       logLevel: "error"
+     });
+-    if (rendered.width < 1 || rendered.height < 1
+-      || rendered.width > message.maxDimension || rendered.height > message.maxDimension) {
++    // Check the parsed dimensions before allocating the RGBA raster. This
++    // worker is isolated, so a native parse/render panic remains recoverable.
++    if (renderer.width < 1 || renderer.height < 1
++      || renderer.width > message.maxDimension || renderer.height > message.maxDimension
++      || renderer.width * renderer.height > message.maxPixels) {
+       send({
+         id: message.id,
+         ok: false,
+         code: "raster-limit",
+-        message: `formula raster exceeds ${message.maxDimension}x${message.maxDimension} pixels`
++        message: `formula raster ${renderer.width}x${renderer.height} exceeds limits (${message.maxDimension}px per side, ${message.maxPixels} pixels total)`
+       });
+       return;
+     }
++    const rendered = renderer.render();
+     if (!hasVisiblePixel(rendered.pixels)) {
+       send({
+         id: message.id,
+diff --git a/src/screen-text.ts b/src/screen-text.ts
+index 2accd27..a9c3ddc 100644
+--- a/src/screen-text.ts
++++ b/src/screen-text.ts
+@@ -519,16 +519,15 @@ function mappedFormulaFromRegion(
+ export function detectScreenFormulaRegions(
+   physicalLines: PhysicalScreenLine[],
+   terminalColumns: number,
+-  continuesAfterViewport = false
++  continuesAfterViewport = false,
++  strict = false
+ ): FormulaSnapshot {
+   if (!physicalLines.some((line) => containsFormulaTrigger(line.text))) {
+     return { formulas: [], deferred: [] };
+   }
+   const logicalLines = collapseSoftWrappedLines(physicalLines, continuesAfterViewport);
+-  const detected = composeInlineFormulaTails(
+-    logicalLines,
+-    detectFormulas(logicalLines.map((line) => line.text)).map(detectedFormulaRegion)
+-  );
++  const formulas = detectFormulas(logicalLines.map((line) => line.text), { strict }).map(detectedFormulaRegion);
++  const detected = strict ? formulas : composeInlineFormulaTails(logicalLines, formulas);
+   const regions: PhysicalFormulaCandidate[] = [];
+   const deferred: FormulaSnapshot["deferred"] = [];
+ 
+diff --git a/src/screen.ts b/src/screen.ts
+index 1b4a26b..1d0302e 100644
+--- a/src/screen.ts
++++ b/src/screen.ts
+@@ -1,4 +1,4 @@
+-import { createHash } from "node:crypto";
++import { createHash, randomInt } from "node:crypto";
+ import { createRequire } from "node:module";
+ import type {
+   IBufferCell,
+@@ -55,6 +55,7 @@ interface PlannedFormulaSnapshot {
+ }
+ 
+ interface PlacedFormula {
++  transparentCanvas?: { startCol: number; endCol: number };
+   anchor: string;
+   imageId: number;
+   placementId: number;
+@@ -428,6 +429,8 @@ function lineTextSnapshot(line: IBufferLine | undefined, translatedText?: string
+ export class FormulaScreen {
+   readonly terminal: XtermTerminal;
+   readonly #renderer: MathRenderer;
++  readonly #strictDetection: boolean;
++  readonly #presentation?: XtermTerminal;
+   readonly #transmitImage: (png: Uint8Array, imageId: number) => string;
+   readonly #placed = new Map<string, PlacedFormula>();
+   /**
+@@ -491,6 +494,7 @@ export class FormulaScreen {
+   #layoutVersion = 0;
+   #resizeGeneration = 0;
+   #scanning = false;
++  #cachedScanMiss = false;
+   #rescanRequested = false;
+   readonly #scanWaiters: Array<() => void> = [];
+   #pendingWrites = 0;
+@@ -508,6 +512,7 @@ export class FormulaScreen {
+   #alternate47Restored = false;
+   #pendingWrapHeldColumns?: number;
+   #graphicsSynchronizedOutputOverride?: boolean;
++  #outputFrameActive = false;
+   #normalTrimGeneration = 0;
+   #resizing = false;
+   #disposed = false;
+@@ -526,6 +531,8 @@ export class FormulaScreen {
+     scale: number;
+     minReadableScale?: number;
+     stabilityMs?: number;
++    transparentBackground?: boolean;
++    strictDetection?: boolean;
+     writeOuter: (data: string | Uint8Array) => void;
+     writeGraphics?: (
+       create: () => string | Uint8Array | undefined
+@@ -553,6 +560,23 @@ export class FormulaScreen {
+     // ZWJ families). Wrong cell widths corrupt both formula anchors and the
+     // cursor position restored after a Kitty placement.
+     this.terminal.loadAddon(new UnicodeGraphemesAddon());
++    this.#strictDetection = Boolean(options.strictDetection);
++    if (options.transparentBackground) {
++      this.#presentation = new Terminal({
++        cols: options.cols, rows: options.rows, scrollback: MIRROR_SCROLLBACK_ROWS,
++        allowProposedApi: true, reflowCursorLine: true
++      });
++      this.#presentation.loadAddon(new UnicodeGraphemesAddon());
++      // Transparent scrollback images outlive the proxy. Avoid reusing their
++      // IDs or deleting their pins when another proxy starts in this terminal.
++      this.#imageId = randomInt(TFORMULA_IMAGE_ID_MIN, TFORMULA_IMAGE_ID_MAX);
++    }
++    if (options.capabilities.initialCursor) {
++      const { row, column } = options.capabilities.initialCursor;
++      const initialPosition = cursorPosition(row, column);
++      this.terminal.write(initialPosition);
++      this.#presentation?.write(initialPosition);
++    }
+     this.#capabilities = options.capabilities;
+     this.#scale = options.scale;
+     this.#minReadableScale = Number.isFinite(options.minReadableScale)
+@@ -580,7 +604,7 @@ export class FormulaScreen {
+       0,
+       Math.floor(options.maxDetachedPlacements ?? DEFAULT_MAX_DETACHED_PLACEMENTS)
+     );
+-    if (this.#capabilities.kittyGraphics) {
++    if (this.#capabilities.kittyGraphics && !this.#presentation) {
+       // A previous TFormula process may have crashed before dispose(). Image
+       // ids restart per process, so remove only our dedicated z-index before
+       // the first upload can accidentally rebind an orphaned placement.
+@@ -699,29 +723,98 @@ export class FormulaScreen {
+     }
+   }
+ 
+-  #writeTerminal(data: string): Promise<void> {
++  async #writeTerminal(data: string): Promise<void> {
+     if (!data) return Promise.resolve();
+-    return new Promise((resolve) => this.terminal.write(data, resolve));
++    await Promise.all([
++      new Promise<void>((resolve) => this.terminal.write(data, resolve)),
++      this.#writePresentation(data)
++    ]);
++  }
++
++  #writePresentation(data: string): Promise<void> {
++    if (!this.#presentation || !data) return Promise.resolve();
++    // Graphics do not change terminal cells; avoid parsing large PNG payloads.
++    const cells = data.replace(/\x1b_G[^\x1b]*\x1b\\/gu, "");
++    return new Promise((resolve) => this.#presentation!.write(cells, resolve));
++  }
++
++  /** Repaint only character attributes, retaining the original copyable text. */
++  #sourceVisibility(plan?: FormulaPlacementPlan, restoreAll = false): string | undefined {
++    if (!this.#presentation) return "";
++    const buffer = this.terminal.buffer.active;
++    const shown = this.#presentation.buffer.active;
++    if (buffer.type !== shown.type || this.terminal.modes.originMode
++      || this.terminal.modes.insertMode || !xtermUsesDefaultCharset(this.terminal)) return undefined;
++    const pen = xtermPrivateCore(this.terminal)?._inputHandler?._curAttrData;
++    if (!isXtermRendition(pen) || pen.extended._urlId !== 0) return undefined;
++    const penSgr = xtermRenditionSgr(pen);
++    const cursor = this.#cursorRestoreAfterGraphics();
++    if (!penSgr || !cursor) return undefined;
++    const ranges = plan
++      ? (plan.sourceMasks.length ? plan.sourceMasks : Array.from(
++          { length: plan.canvas.endRow - plan.canvas.startRow + 1 }, (_, rowOffset) => ({
++            rowOffset, startCol: 0,
++            endCol: plan.canvas.endCol - plan.canvas.startCol, logicalStartCol: 0
++          })
++        )).map((s) => ({ row: plan.canvas.startRow + s.rowOffset,
++          start: plan.canvas.startCol + s.startCol, end: plan.canvas.startCol + s.endCol }))
++      : Array.from({ length: this.terminal.rows }, (_, row) => ({ row, start: 0, end: this.terminal.cols }));
++    const covered = (row: number, column: number): boolean => !restoreAll
++      && [...this.#placed.values()].some((p) => {
++        if (p.bufferType !== buffer.type || !p.transparentCanvas) return false;
++        const bounds = this.#placementBounds(p);
++        return row + buffer.viewportY >= bounds.start && row + buffer.viewportY <= bounds.end
++          && column >= p.transparentCanvas.startCol && column < p.transparentCanvas.endCol;
++      });
++    const parts: string[] = [];
++    for (const range of ranges) {
++      if (range.row < 0 || range.row >= this.terminal.rows) continue;
++      const line = buffer.getLine(buffer.viewportY + range.row);
++      const visible = shown.getLine(shown.viewportY + range.row);
++      for (let col = Math.max(0, range.start); col < Math.min(range.end, this.terminal.cols); col++) {
++        const cell = line?.getCell(col);
++        const actual = visible?.getCell(col);
++        if (!cell || cell.getWidth() === 0 || !cell.getChars()) continue;
++        if (!plan && (!actual?.isInvisible() || cell.isInvisible() || covered(range.row, col))) continue;
++        const rendition = cell as unknown as XtermRendition;
++        if (!isXtermRendition(rendition) || rendition.extended._urlId !== 0) return undefined;
++        const sgr = xtermRenditionSgr(rendition);
++        if (!sgr) return undefined;
++        if (plan && actual?.isInvisible() && actual.getChars() === cell.getChars()) continue;
++        parts.push(cursorPosition(range.row + 1, col + 1), sgr,
++          `\x1b[${rendition.isProtected() ? 1 : 0}\"q`, plan ? "\x1b[8m" : "", cell.getChars());
++      }
++    }
++    return parts.length ? parts.join("") + penSgr
++      + `\x1b[${pen.isProtected() ? 1 : 0}\"q` + cursor : "";
+   }
+ 
+   async #writeGraphicsTransaction(
+     value: string | (() => string | Uint8Array | undefined)
+   ): Promise<boolean> {
++    let mirrored = "";
+     const create = (): string | Uint8Array | undefined => {
+       const data = typeof value === "function" ? value() : value;
+       if (data === undefined) return undefined;
++      if (data.length === 0) return undefined;
++      mirrored = String(data);
+       // DEC synchronized output is a boolean mode, not a stack. Opening and
+       // closing our own frame inside an Agent-owned frame would close theirs.
+-      return (this.#graphicsSynchronizedOutputOverride
+-        ?? this.terminal.modes.synchronizedOutputMode)
++      return (this.#outputFrameActive || (this.#graphicsSynchronizedOutputOverride
++        ?? this.terminal.modes.synchronizedOutputMode))
+         ? data
+         : synchronizedOutput(String(data));
+     };
+     try {
+-      if (this.#writeGraphics) return await this.#writeGraphics(create);
++      if (this.#writeGraphics) {
++        const emitted = await this.#writeGraphics(create);
++        if (emitted) await this.#writePresentation(mirrored);
++        return emitted;
++      }
+       const data = create();
+       if (data === undefined) return false;
+       this.#writeOuter(data);
++      await this.#writePresentation(mirrored);
+       return true;
+     } catch (error) {
+       // Fire-and-forget lifecycle deletes use this same path. Never create an
+@@ -740,6 +833,11 @@ export class FormulaScreen {
+     return this.terminal.modes.synchronizedOutputMode;
+   }
+ 
++  /** Covers lifecycle deletes during mirror writes as well as the final scan. */
++  setOutputFrameActive(active: boolean): void {
++    this.#outputFrameActive = active;
++  }
++
+   get pendingWrap(): boolean {
+     return this.terminal.buffer.active.cursorX >= this.terminal.cols;
+   }
+@@ -1073,7 +1171,51 @@ export class FormulaScreen {
+     if (!this.#layoutSuspended) this.scheduleScan();
+   }
+ 
+-  /** Complete a scan before more PTY rows are allowed to scroll the viewport. */
++  /** Place memory-cached formulas before frame release; never wait for typesetting. */
++  async flushCachedScan(ownFrame = false): Promise<boolean> {
++    if (this.#disposed || this.#scanning || this.#layoutSuspended) return false;
++    const previous = this.#graphicsSynchronizedOutputOverride;
++    if (ownFrame) this.#graphicsSynchronizedOutputOverride = true;
++    this.#cachedScanMiss = false;
++    try {
++      await this.#scan(true, true, true);
++      return !this.#cachedScanMiss;
++    }
++    finally { this.#graphicsSynchronizedOutputOverride = previous; }
++  }
++
++  /** Give an in-flight render or a new layout a bounded chance to join this frame. */
++  async flushFrameScan(ownFrame = false, budgetMs = 40): Promise<void> {
++    if (this.#disposed || this.#layoutSuspended) return;
++    const previous = this.#graphicsSynchronizedOutputOverride;
++    if (ownFrame) this.#graphicsSynchronizedOutputOverride = true;
++    const deadline = performance.now() + budgetMs;
++    const withinBudget = async (work: Promise<unknown>): Promise<boolean> => {
++      let timer: NodeJS.Timeout | undefined;
++      try {
++        return await Promise.race([
++          work.then(() => true),
++          new Promise<false>((resolve) => {
++            timer = setTimeout(() => resolve(false), Math.max(0, deadline - performance.now()));
++          })
++        ]);
++      } finally { if (timer) clearTimeout(timer); }
++    };
++    try {
++      while (this.#scanning && performance.now() < deadline) {
++        let done!: () => void;
++        const waiting = new Promise<void>((resolve) => { done = resolve; this.#scanWaiters.push(done); });
++        const finished = await withinBudget(waiting);
++        const index = this.#scanWaiters.indexOf(done);
++        if (index >= 0) this.#scanWaiters.splice(index, 1);
++        if (!finished || this.#disposed || this.#layoutSuspended) return;
++      }
++      if (this.#scanning) return;
++      if (await this.flushCachedScan(ownFrame)) return;
++      if (performance.now() < deadline) await withinBudget(this.#scan(true, true));
++    } finally { this.#graphicsSynchronizedOutputOverride = previous; }
++  }
++
+   async flushScan(allowQueuedWrites = false): Promise<void> {
+     while (!this.#disposed) {
+       if (!allowQueuedWrites && this.#pendingWrites > 0) {
+@@ -1158,6 +1300,12 @@ export class FormulaScreen {
+     try {
+       this.terminal.resize(nextCols, nextRows);
+       if (cursorLineReflow) this.#restoreCursorLineReflow(cursorLineReflow);
++      this.#presentation?.resize(nextCols, nextRows);
++      if (this.#presentation) {
++        const target = mutableXtermBufferCursor(this.#presentation);
++        const source = mutableXtermBufferCursor(this.terminal);
++        if (target && source) { target.x = source.x; target.y = source.y; }
++      }
+     } finally {
+       cursorLineReflow?.startMarker?.dispose();
+       this.#resizing = false;
+@@ -1284,7 +1432,7 @@ export class FormulaScreen {
+     const colorsChanged = capabilities.foreground !== this.#capabilities.foreground
+       || capabilities.background !== this.#capabilities.background;
+     this.#capabilities = capabilities;
+-    if (graphicsChanged && capabilities.kittyGraphics) {
++    if (graphicsChanged && capabilities.kittyGraphics && !this.#presentation) {
+       this.#writeGraphicsTransaction(kittyDeleteByZIndex());
+     }
+     if (resumeEpoch !== undefined && resumeEpoch === this.#layoutEpoch) {
+@@ -1339,6 +1487,7 @@ export class FormulaScreen {
+     if (this.#capabilities.kittyGraphics) {
+       const imageIds = new Set(Array.from(this.#terminalImages.values(), (image) => image.imageId));
+       const commands = [
++        this.#presentation ? (this.#sourceVisibility(undefined, true) ?? "") : "",
+         ...Array.from(imageIds, (imageId) => kittyDeleteImage(imageId)),
+         // The dedicated z-index catches placements from interrupted scans and
+         // previous crashed sessions. Avoid d=R: Ghostty 1.3.1 implements its
+@@ -1480,7 +1629,9 @@ export class FormulaScreen {
+     }
+     this.#layoutVersion += 1;
+     this.#debug(`${reason}; invalidated terminal image ${imageId}`);
++    if (this.#presentation) void this.#writeGraphicsTransaction(() => this.#sourceVisibility());
+     if (willRetry) this.scheduleScan(retryDelay || 50, true);
++    else if (this.#presentation) this.scheduleScan(0, true);
+     return true;
+   }
+ 
+@@ -1536,8 +1687,10 @@ export class FormulaScreen {
+     }
+     this.#layoutVersion += 1;
+     this.#debug(`${reason}; invalidated terminal placement ${placementId}`);
++    if (this.#presentation) void this.#writeGraphicsTransaction(() => this.#sourceVisibility());
+     this.#evictIdleTerminalImages();
+     if (retryDelay > 0) this.scheduleScan(retryDelay, true);
++    else if (this.#presentation) this.scheduleScan(0, true);
+     return true;
+   }
+ 
+@@ -1994,7 +2147,12 @@ export class FormulaScreen {
+     for (const resolve of this.#scanWaiters.splice(0)) resolve();
+     for (const resolve of this.#writeWaiters.splice(0)) resolve();
+     for (const resolve of this.#layoutWaiters.splice(0)) resolve();
+-    this.resetPlacements();
++    if (this.#presentation) {
++      // Preserve normal-buffer pins, including scrollback: concealed source
++      // remains copyable beneath those transparent images after process exit.
++      // Alternate-buffer images are owned by that buffer and disappear on exit.
++      this.#presentation.dispose();
++    } else this.resetPlacements();
+     this.terminal.dispose();
+   }
+ 
+@@ -2052,7 +2210,8 @@ export class FormulaScreen {
+         detectScreenFormulaRegions(
+           physicalLines,
+           this.terminal.cols,
+-          continuesAfterViewport
++          continuesAfterViewport,
++          this.#strictDetection
+         ),
+         physicalLines
+       )
+@@ -2091,7 +2250,8 @@ export class FormulaScreen {
+         detectScreenFormulaRegions(
+           detailedLines,
+           this.terminal.cols,
+-          continuesAfterViewport
++          continuesAfterViewport,
++          this.#strictDetection
+         ),
+         detailedLines
+       )
+@@ -2386,7 +2546,7 @@ export class FormulaScreen {
+       && bounds.end === viewportY + region.canvas.endRow;
+   }
+ 
+-  async #scan(allowQueuedWrites = false, forceStable = false): Promise<void> {
++  async #scan(allowQueuedWrites = false, forceStable = false, cachedOnly = false): Promise<void> {
+     if (this.#disposed || !this.#capabilities.kittyGraphics || this.terminal.modes.originMode) return;
+     if ((!allowQueuedWrites && this.#pendingWrites > 0) || this.#layoutSuspended) {
+       this.#rescanRequested = true;
+@@ -2526,6 +2686,9 @@ export class FormulaScreen {
+           // expire at the scrollback cap and make an evicted row look live.
+           existing.layoutHint = undefined;
+           existing.layoutHintTrimGeneration = undefined;
++          if (existing.transparentCanvas) {
++            await this.#writeGraphicsTransaction(() => this.#sourceVisibility(plan));
++          }
+           continue;
+         }
+         const placementRetryKey = `${anchor}|${fingerprint}`;
+@@ -2551,12 +2714,21 @@ export class FormulaScreen {
+         }
+ 
+         try {
+-          const rendered = await this.#renderer.renderPlacement(
++          const transparent = Boolean(this.#presentation) && this.#sourceVisibility(plan) !== undefined;
++          const background = transparent ? "transparent" : renderColors.background;
++          const cached = cachedOnly ? this.#renderer.cachedPlacement(plan, this.#capabilities,
++            this.#scale, renderColors.foreground, background) : undefined;
++          if (cachedOnly && !cached) {
++            this.#cachedScanMiss = true;
++            retryDelay = Math.min(retryDelay ?? 16, 16);
++            continue;
++          }
++          const rendered = cached ?? await this.#renderer.renderPlacement(
+             plan,
+             this.#capabilities,
+             this.#scale,
+             renderColors.foreground,
+-            renderColors.background
++            background
+           );
+           if (this.#disposed
+             || (!allowQueuedWrites && this.#pendingWrites > 0)
+@@ -2677,8 +2849,11 @@ export class FormulaScreen {
+                 || this.terminal.buffer.active.type !== bufferType) return undefined;
+               const restoreCursor = this.#cursorRestoreAfterGraphics();
+               if (!restoreCursor) return undefined;
++              const sourceConcealment = transparent ? this.#sourceVisibility(plan) : "";
++              if (sourceConcealment === undefined) return undefined;
+               return [
+                 existing ? kittyDeletePlacement(existing.imageId, existing.placementId) : "",
++                sourceConcealment,
+                 cursorPosition(plan.canvas.startRow + 1, plan.canvas.startCol + 1),
+                 kittyPlaceImage(image.imageId, placementId, columns, rows),
+                 restoreCursor
+@@ -2723,6 +2898,9 @@ export class FormulaScreen {
+           image.lastUsed = ++this.#imageUse;
+           const markers = this.#markersForRegion(region);
+           this.#placed.set(anchor, {
++            ...(transparent ? { transparentCanvas: {
++              startCol: plan.canvas.startCol, endCol: plan.canvas.endCol
++            } } : {}),
+             anchor,
+             imageId: image.imageId,
+             placementId,
+@@ -2860,6 +3038,9 @@ export class FormulaScreen {
+         }
+       }
+     } finally {
++      if (this.#presentation && !this.#disposed && !this.#layoutSuspended) {
++        await this.#writeGraphicsTransaction(() => this.#sourceVisibility());
++      }
+       // A scan that never reached its reconciliation — disposed, layout
+       // suspended, a render throwing — must not leave images reserved. Each
+       // aborted attempt would otherwise strand another generation of them
+diff --git a/src/terminal-output.ts b/src/terminal-output.ts
+index f74c6b6..2138403 100644
+--- a/src/terminal-output.ts
++++ b/src/terminal-output.ts
+@@ -405,6 +405,15 @@ export class TerminalCellHoldback {
+     this.#consume(data, false);
+   }
+ 
++  /** Protocol-aware frame boundaries; ignores lookalikes inside OSC/APC/DCS. */
++  trackFrameTransitions(data: string): {
++    before: boolean; after: boolean; transitions: SynchronizedOutputTransition[]
++  } {
++    const consumed = this.#consume(data, false);
++    return { before: consumed.synchronizedOutputModeBefore,
++      after: this.#synchronizedOutputMode, transitions: consumed.synchronizedOutputTransitions };
++  }
++
+   #consume(data: string, collectPrintable = true): ConsumedTerminalText {
+     let textRunStart: number | undefined;
+     let lastPrintableRunStart: number | undefined;
+diff --git a/src/types.ts b/src/types.ts
+index 8d59635..d0d60e6 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -5,6 +5,8 @@ export interface CellMetrics {
+ }
+ 
+ export interface TerminalCapabilities {
++  /** One-based cursor position observed before the proxied child starts. */
++  initialCursor?: { row: number; column: number };
+   kittyGraphics: boolean;
+   foreground: string;
+   background: string;
+diff --git a/test/math-renderer.test.ts b/test/math-renderer.test.ts
+index 58f0581..9e7411f 100644
+--- a/test/math-renderer.test.ts
++++ b/test/math-renderer.test.ts
+@@ -199,7 +199,11 @@ describe("MathRenderer", () => {
+     await expect(mathRendererInternals.renderSvgToPng("<svg><broken>", false))
+       .rejects.toMatchObject({ code: "raster-error" });
+     await expect(mathRendererInternals.renderSvgToPng(
+-      '<svg xmlns="http://www.w3.org/2000/svg" width="4097" height="1"><rect width="1" height="1"/></svg>',
++      '<svg xmlns="http://www.w3.org/2000/svg" width="8193" height="1"><rect width="1" height="1"/></svg>',
++      false
++    )).rejects.toMatchObject({ code: "raster-limit" });
++    await expect(mathRendererInternals.renderSvgToPng(
++      '<svg xmlns="http://www.w3.org/2000/svg" width="5000" height="4000"><rect width="1" height="1"/></svg>',
+       false
+     )).rejects.toMatchObject({ code: "raster-limit" });
+     await expect(mathRendererInternals.renderSvgToPng(
+@@ -208,6 +212,22 @@ describe("MathRenderer", () => {
+     )).rejects.toMatchObject({ code: "empty-raster" });
+   });
+ 
++  it("renders full-width formulas on a 255-column Retina terminal without shrinking", async () => {
++    const rendered = await renderTestRegion(new MathRenderer(), {
++      startRow: 0, endRow: 2, startCol: 0, endCol: 255,
++      latex: String.raw`\int_0^1 x^2\,dx = \frac{1}{3}`,
++      display: true, confidence: "explicit"
++    }, 255, 3, {
++      kittyGraphics: true,
++      cell: { width: 18, height: 40, source: "query" },
++      foreground: "#ffffff", background: "#000000"
++    }, 1);
++    expect(rendered.widthPx).toBe(4590);
++    expect(rendered.heightPx).toBe(120);
++    expect(rendered.fitScale).toBe(1);
++    expect(rendered.png.readUInt32BE(16)).toBe(4590);
++  });
++
+   it("computes exact half-open alpha bounds", () => {
+     const pixels = Buffer.alloc(4 * 4 * 4);
+     pixels[(1 * 4 + 2) * 4 + 3] = 255;
+diff --git a/test/probe.test.ts b/test/probe.test.ts
+index 23f4544..1eb6579 100644
+--- a/test/probe.test.ts
++++ b/test/probe.test.ts
+@@ -11,6 +11,15 @@ import {
+ } from "../src/probe.js";
+ 
+ describe("terminal probing", () => {
++  it("captures the startup cursor, including fragmented replies, without consuming later child queries", () => {
++    const parsed = parseTerminalResponses("typed\x1b[7;19R");
++    expect(parsed.initialCursor).toEqual({ row: 7, column: 19 });
++    expect(parsed.residual).toBe("typed");
++    const filter = new TerminalProbeResponseFilter();
++    expect(filter.push("\x1b[7;", true).residual).toBe("");
++    expect(filter.push("19R", true).responses).toEqual(["\x1b[7;19R"]);
++    expect(filter.push("\x1b[4;5R", false).residual).toBe("\x1b[4;5R");
++  });
+   it("extracts cell, window, and theme responses without losing typed input", () => {
+     const parsed = parseTerminalResponses([
+       "typed",
+diff --git a/test/proxy-e2e.test.ts b/test/proxy-e2e.test.ts
+index 348956a..f29a5fe 100644
+--- a/test/proxy-e2e.test.ts
++++ b/test/proxy-e2e.test.ts
+@@ -441,12 +441,20 @@ describe("runProxy pseudo-terminal integration", () => {
+         replyToNewOccurrences(`${ESC}[c`, () => `${ESC}[?62;4;6;22c`);
+         answerCompletedKittyCommands();
+ 
+-        if (!resized && transcript.includes("TFORMULA_FIXTURE_READY")) {
++        // READY is child text, not a renderer barrier. Bounded frame release
++        // can deliver it before the asynchronous initial placements finish.
++        const initialImages = new Map<string, Set<string>>();
++        for (const match of transcript.matchAll(/\x1b_Ga=p,([^\x1b]*)\x1b\\/gu)) {
++          const controls = match[1]!;
++          const id = controlValue(controls, "i") ?? "";
++          const placements = initialImages.get(id) ?? new Set<string>();
++          placements.add(controlValue(controls, "p") ?? "");
++          initialImages.set(id, placements);
++        }
++        const sharedImageReady = [...initialImages.values()].some((ids) => ids.size >= 2);
++        if (!resized && transcript.includes("TFORMULA_FIXTURE_READY") && sharedImageReady) {
+           resized = true;
+-          transcriptBeforeResize = transcript.slice(
+-            0,
+-            transcript.indexOf("TFORMULA_FIXTURE_READY") + "TFORMULA_FIXTURE_READY".length
+-          );
++          transcriptBeforeResize = transcript;
+           const geometries = [
+             [72, 20],
+             [128, 38],
+@@ -489,7 +497,10 @@ describe("runProxy pseudo-terminal integration", () => {
+     if (remote) expect(injectedPlacementFailure).toBe(true);
+     if (!remote && process.platform === "darwin") expect(injectedUploadFailure).toBe(true);
+     expect(delayedRuntimeAck).toBe(delayedRuntimeProbe);
+-    expect(transcript).toContain(`LONG_NO_LF_BEGIN:${"x".repeat(1_600)}:LONG_NO_LF_END`);
++    // Frame wrappers may split a long printable run at checkpoint boundaries;
++    // no characters or any other terminal controls may be inserted into it.
++    expect(transcript.replace(/\x1b\[\?2026[hl]/gu, ""))
++      .toContain(`LONG_NO_LF_BEGIN:${"x".repeat(1_600)}:LONG_NO_LF_END`);
+ 
+     // If TFormula inserts an image between two callbacks of either control,
+     // the original byte sequence will no longer occur contiguously here.
+@@ -502,6 +513,7 @@ describe("runProxy pseudo-terminal integration", () => {
+     // A direct PNG transfer is allowed, but its Base64 must never escape its
+     // terminated APC and become visible terminal text.
+     const ordinaryOutput = withoutApcs
++      .replace(/\x1b\[\?2026[hl]/gu, "")
+       // The wrapped Agent intentionally emits both of these strings. They are
+       // control-integrity sentinels, not leaked TFormula image data.
+       .replace(CHILD_OSC, "")
+diff --git a/benchmark/scroll-frames.mjs b/benchmark/scroll-frames.mjs
+new file mode 100644
+index 0000000..8ff3e22
+--- /dev/null
++++ b/benchmark/scroll-frames.mjs
+@@ -0,0 +1,58 @@
++import { spawn } from "node-pty";
++import { fileURLToPath } from "node:url";
++import { mkdtempSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join, resolve } from "node:path";
++import { performance } from "node:perf_hooks";
++
++const root = fileURLToPath(new URL("../", import.meta.url));
++const cli = resolve(process.argv[2] ?? join(root, "dist/cli.js"));
++const cache = mkdtempSync(join(tmpdir(), "tformula-scroll-"));
++const env = { ...process.env, TERM: "xterm-ghostty", TERM_PROGRAM: "ghostty",
++  TFORMULA_TRANSPARENT: "1", TFORMULA_STRICT: "1", TFORMULA_CACHE_DIR: cache };
++delete env.TFORMULA_ACTIVE;
++let transcript = "", pending = "", answered = false, frame;
++const frames = [];
++const pty = spawn(process.execPath, [...(cli.endsWith(".ts") ? ["--import", "tsx"] : []), cli, "--no-history", "--", process.execPath,
++  join(root, "test/fixtures/scroll-agent.mjs")], { name: "xterm-ghostty", cols: 100, rows: 32, cwd: root, env });
++const timeout = setTimeout(() => { pty.kill(); throw new Error("scroll benchmark timed out"); }, 15000);
++pty.onData((data) => {
++  transcript += data;
++  if (!answered && transcript.includes("\x1b[16t")) {
++    answered = true;
++    pty.write("\x1b[1;1R\x1b[6;18;9t\x1b[4;576;900t\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;4;6;22c");
++  }
++  pending += data;
++  const tokens = /\x1b_G[^\x1b]*\x1b\\|FRAME:(\d+)\r|\x1b\[\?2026l/gu;
++  let consumed = 0;
++  for (const match of pending.matchAll(tokens)) {
++    const token = match[0]; consumed = match.index + token.length;
++    const now = performance.now();
++    if (match[1] !== undefined) {
++      frame = { id: Number(match[1]), started: now, placements: 0, readyBeforeRelease: false };
++      frames.push(frame);
++    } else if (token.startsWith("\x1b_G")) {
++      const id = token.match(/(?:^|,)i=(\d+)/u)?.[1] ?? token.match(/_Gi=(\d+)/u)?.[1];
++      const placement = token.match(/(?:^|,)p=(\d+)/u)?.[1];
++      if (id) pty.write(`\x1b_Gi=${id}${placement ? `,p=${placement}` : ""};OK\x1b\\`);
++      if (token.includes("a=p") && frame) {
++        frame.placements++;
++        if (frame.placements === 4) frame.imageLatencyMs = now - frame.started;
++      }
++    } else if (frame && frame.releaseMs === undefined) {
++      frame.releaseMs = now - frame.started;
++      frame.readyBeforeRelease = frame.placements >= 4;
++    }
++  }
++  pending = pending.slice(consumed);
++});
++pty.onExit(({ exitCode }) => {
++  clearTimeout(timeout); rmSync(cache, { recursive: true, force: true });
++  const warm = frames.filter((f) => f.id > 0);
++  const latency = warm.flatMap((f) => f.imageLatencyMs === undefined ? [] : [f.imageLatencyMs]).sort((a, b) => a - b);
++  console.log(JSON.stringify({ cli, exitCode, redrawMode: env.TFORMULA_SCROLL_FRAGMENTED ?? "synchronized", warmFrames: warm.length,
++    imagesReadyBeforeFrameRelease: warm.filter((f) => f.readyBeforeRelease).length,
++    medianImageLatencyMs: latency.length ? +latency[Math.floor(latency.length / 2)].toFixed(2) : null,
++    frames: warm.map(({ started, ...f }) => f) }, null, 2));
++  process.exitCode = exitCode;
++});
+diff --git a/src/frame-boundaries.ts b/src/frame-boundaries.ts
+new file mode 100644
+index 0000000..81e8ecb
+--- /dev/null
++++ b/src/frame-boundaries.ts
+@@ -0,0 +1,31 @@
++import { TerminalCellHoldback } from "./terminal-output.js";
++
++export interface TerminalFramePart {
++  data: string;
++  inFrame: boolean;
++  /** Release this frame only after cached formula placements have been drawn. */
++  end?: string;
++}
++
++/** Input has already passed TerminalControlGate, so CSI sequences are complete. */
++export class TerminalFrameBoundaries {
++  readonly #tracker = new TerminalCellHoldback();
++
++  push(data: string): TerminalFramePart[] {
++    const state = this.#tracker.trackFrameTransitions(data);
++    const parts: TerminalFramePart[] = [];
++    let start = 0;
++    let inFrame = state.before;
++    for (const transition of state.transitions) {
++      if (transition.enabled) { inFrame = true; continue; }
++      const boundary = Math.max(data.lastIndexOf("\x1b[", transition.end - 1),
++        data.lastIndexOf("\u009b", transition.end - 1));
++      parts.push({ data: data.slice(start, boundary), inFrame,
++        end: data.slice(boundary, transition.end) });
++      start = transition.end;
++      inFrame = false;
++    }
++    if (start < data.length) parts.push({ data: data.slice(start), inFrame: inFrame || state.after });
++    return parts;
++  }
++}
+diff --git a/src/output-coalescer.ts b/src/output-coalescer.ts
+new file mode 100644
+index 0000000..c0cd198
+--- /dev/null
++++ b/src/output-coalescer.ts
+@@ -0,0 +1,33 @@
++/** Join adjacent SSH/tmux redraw fragments without waiting indefinitely on streams. */
++export class OutputCoalescer {
++  #parts: string[] = [];
++  #size = 0;
++  #idle?: NodeJS.Timeout;
++  #limit?: NodeJS.Timeout;
++
++  constructor(readonly emit: (data: string) => void,
++    readonly idleMs = 16, readonly maxMs = 32, readonly maxChars = 65_536) {}
++
++  get pending(): boolean { return this.#parts.length > 0; }
++
++  push(data: string, holdEmpty = false): void {
++    if (!data && !holdEmpty) return;
++    if (!this.pending) this.#limit = setTimeout(() => this.flush(), this.maxMs);
++    this.#parts.push(data);
++    this.#size += data.length;
++    if (this.#idle) clearTimeout(this.#idle);
++    if (this.#size >= this.maxChars) this.flush();
++    else this.#idle = setTimeout(() => this.flush(), this.idleMs);
++  }
++
++  flush(): void {
++    if (this.#idle) clearTimeout(this.#idle);
++    if (this.#limit) clearTimeout(this.#limit);
++    this.#idle = this.#limit = undefined;
++    if (!this.pending) return;
++    const data = this.#parts.join("");
++    this.#parts = [];
++    this.#size = 0;
++    this.emit(data);
++  }
++}
+diff --git a/test/fixtures/scroll-agent.mjs b/test/fixtures/scroll-agent.mjs
+new file mode 100644
+index 0000000..300fc76
+--- /dev/null
++++ b/test/fixtures/scroll-agent.mjs
+@@ -0,0 +1,26 @@
++const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
++process.stdin.setRawMode(true);
++process.stdout.write("\x1b[?1049h");
++const tmuxSplit = process.env.TFORMULA_SCROLL_FRAGMENTED === "tmux";
++const fragmented = process.env.TFORMULA_SCROLL_FRAGMENTED === "1" || tmuxSplit;
++for (let frame = 0; frame <= 12; frame++) {
++  const text = `${fragmented && !tmuxSplit ? "" : "\x1b[?2026h"}\x1b[2J\x1b[HFRAME:${frame}\r\n`
++    + "\r\n".repeat(frame % 3)
++    + [1, 2, 3, 4].map((n) => `\\[\r\n\\frac{${n}}{${n + 1}}\r\n\\]\r\n\r\n`).join("");
++  if (fragmented) {
++    // tmux redraws can arrive without DEC 2026, split in the middle of TeX.
++    const split = text.indexOf("frac") + 2;
++    process.stdout.write(text.slice(0, split));
++    if (tmuxSplit) process.stdout.write("\x1b[?2026l");
++    await pause(3);
++    process.stdout.write(text.slice(split, split + 23));
++    await pause(3);
++    process.stdout.write(text.slice(split + 23));
++  } else process.stdout.write(text);
++  await pause(2); // A frame end delivered in a separate PTY callback.
++  if (!fragmented) process.stdout.write("\x1b[?2026l");
++  await pause(frame === 0 ? 1400 : 90);
++}
++await pause(300);
++process.stdout.write("\x1b[?1049l");
++process.exit(0);
+diff --git a/test/frame-boundaries.test.ts b/test/frame-boundaries.test.ts
+new file mode 100644
+index 0000000..52d9ee8
+--- /dev/null
++++ b/test/frame-boundaries.test.ts
+@@ -0,0 +1,26 @@
++import { describe, expect, it } from "vitest";
++import { TerminalFrameBoundaries } from "../src/frame-boundaries.js";
++import { TerminalControlGate } from "../src/terminal-output.js";
++const begin = "\x1b[?2026h", end = "\x1b[?2026l";
++describe("terminal frame release", () => {
++  it("holds only frame-ending controls, including frames split between PTY callbacks", () => {
++    const gate = new TerminalFrameBoundaries();
++    expect(gate.push(begin + "partial")).toEqual([{ data: begin + "partial", inFrame: true }]);
++    expect(gate.push("rest" + end + "tail")).toEqual([
++      { data: "rest", inFrame: true, end }, { data: "tail", inFrame: false }
++    ]);
++  });
++  it("leaves lookalikes inside terminal control strings intact", () => {
++    const data = "\x1b]0;title [?2026h [?2026l\x07"
++      + "\x1b_Ppayload [?2026l\x1b\\";
++    expect(new TerminalFrameBoundaries().push(data)).toEqual([{ data, inFrame: false }]);
++  });
++  it("preserves every byte through arbitrary control fragmentation and multiple frames", () => {
++    const data = begin + "frame1" + end + "\u009b?2026hframe2\u009b?2026l";
++    const controls = new TerminalControlGate();
++    const frames = new TerminalFrameBoundaries();
++    const parts = [...data].flatMap((c) => frames.push(controls.push(c)));
++    expect(parts.map((p) => p.data + (p.end ?? "")).join("")).toBe(data);
++    expect(parts.filter((p) => p.end)).toHaveLength(2);
++  });
++});
+diff --git a/test/output-coalescer.test.ts b/test/output-coalescer.test.ts
+new file mode 100644
+index 0000000..50ef01b
+--- /dev/null
++++ b/test/output-coalescer.test.ts
+@@ -0,0 +1,41 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { OutputCoalescer } from "../src/output-coalescer.js";
++
++afterEach(() => vi.useRealTimers());
++describe("unframed SSH output coalescing", () => {
++  it("can hold an empty frame end until an unframed tail arrives", () => {
++    vi.useFakeTimers();
++    const emit = vi.fn();
++    const c = new OutputCoalescer(emit, 8);
++    c.push("", true); vi.advanceTimersByTime(3);
++    expect(c.pending).toBe(true);
++    c.push("remaining TeX"); vi.advanceTimersByTime(8);
++    expect(emit).toHaveBeenCalledExactlyOnceWith("remaining TeX");
++    c.push("", true); vi.advanceTimersByTime(8);
++    expect(emit).toHaveBeenLastCalledWith("");
++  });
++  it("joins a redraw split inside a formula before releasing it", () => {
++    vi.useFakeTimers();
++    const emit = vi.fn();
++    const c = new OutputCoalescer(emit, 8);
++    c.push("\\[\\fr"); vi.advanceTimersByTime(3);
++    c.push("ac{1}{2}"); vi.advanceTimersByTime(3);
++    c.push("\\]"); vi.advanceTimersByTime(7);
++    expect(emit).not.toHaveBeenCalled();
++    vi.advanceTimersByTime(1);
++    expect(emit).toHaveBeenCalledExactlyOnceWith("\\[\\frac{1}{2}\\]");
++    expect(c.pending).toBe(false);
++  });
++  it("bounds continuous streams by time and size and flushes exit tails exactly once", () => {
++    vi.useFakeTimers();
++    const emit = vi.fn();
++    const c = new OutputCoalescer(emit, 8, 24, 32);
++    for (let i = 0; i < 6; i++) { c.push("abc"); vi.advanceTimersByTime(4); }
++    expect(emit).toHaveBeenCalledExactlyOnceWith("abc".repeat(6));
++    c.push("x".repeat(32));
++    expect(emit).toHaveBeenLastCalledWith("x".repeat(32));
++    c.push("exit tail"); c.flush(); c.flush(); vi.advanceTimersByTime(100);
++    expect(emit).toHaveBeenCalledTimes(3);
++    expect(emit).toHaveBeenLastCalledWith("exit tail");
++  });
++});
+diff --git a/test/scroll-frame-e2e.test.ts b/test/scroll-frame-e2e.test.ts
+new file mode 100644
+index 0000000..b0602a8
+--- /dev/null
++++ b/test/scroll-frame-e2e.test.ts
+@@ -0,0 +1,17 @@
++import { execFile } from "node:child_process";
++import { promisify } from "node:util";
++import { describe, expect, it } from "vitest";
++
++describe("fragmented unframed PTY redraws", () => {
++  it.each(["1", "tmux"])("places warm formulas before frame release with fragmentation mode %s", async (mode) => {
++    const { stdout } = await promisify(execFile)(process.execPath,
++      ["benchmark/scroll-frames.mjs", "src/cli.ts"], {
++        cwd: process.cwd(), env: { ...process.env, TFORMULA_SCROLL_FRAGMENTED: mode },
++        timeout: 15_000
++      });
++    const report = JSON.parse(stdout);
++    expect(report.exitCode).toBe(0);
++    expect(report.warmFrames).toBe(12);
++    expect(report.imagesReadyBeforeFrameRelease).toBe(12);
++  }, 16_000);
++});
+diff --git a/test/strict-detection.test.ts b/test/strict-detection.test.ts
+new file mode 100644
+index 0000000..e9b2734
+--- /dev/null
++++ b/test/strict-detection.test.ts
+@@ -0,0 +1,39 @@
++import { describe, expect, it } from "vitest";
++import { detectFormulas } from "../src/detect.js";
++import { detectScreenFormulaRegions } from "../src/screen-text.js";
++
++const detect = (lines: string[]) => detectFormulas(lines, { strict: true }).map((f) => f.latex);
++describe("strict terminal math detection", () => {
++  it("leaves literal backticks, identifiers, parentheses and code examples alone", () => {
++    expect(detect(["``", "()", "(x)", "(x=1)", "函数 foo() 和 (说明)", "a_b", "`$x^2$`", "``\\(y^2\\)``",
++      "```latex", "$$z^2$$", "```", "真实公式 $p^2$"]))
++      .toEqual(["p^2"]);
++  });
++  it("protects streamed open code spans, unequal runs and hard-wrapped code", () => {
++    expect(detect(["`$x^2$"])).toEqual([]);
++    expect(detect(["`` $x^2$ ` $y^2$"])).toEqual([]);
++    expect(detect(["literal ``", "", "$x^2$ and `` literal"])).toEqual(["x^2"]);
++    expect(detect(["代码 ``$x^2$", "% not a TeX comment here`` 后面 $z^2$"]))
++      .toEqual(["z^2"]);
++  });
++  it("still accepts explicit inline/display math and complete environments", () => {
++    expect(detect(["$x^2$", "\\(y^2\\)", "\\[", "\\frac{1}{3}", "\\]",
++      "$$z^2$$", "\\begin{equation}a=b\\end{equation}"]))
++      .toEqual(expect.arrayContaining(["x^2", "y^2", "\\frac{1}{3}", "z^2", "\\begin{equation}a=b\\end{equation}"]));
++  });
++  it("never packs prose or backticks following a formula into its image", () => {
++    const text = "公式 $x^2$，后面是 `` 和 `a_b`。";
++    const snapshot = detectScreenFormulaRegions([{ row: 0, text, isWrapped: false }], 100, false, true);
++    expect(snapshot.formulas).toHaveLength(1);
++    expect(snapshot.formulas[0]!.formula.latex).toBe("x^2");
++    expect(snapshot.formulas[0]!.composite).toBe(false);
++    expect(snapshot.formulas[0]!.source.endCol).toBeLessThan(12);
++  });
++  it("protects a code span split by terminal soft wrapping", () => {
++    const snapshot = detectScreenFormulaRegions([
++      { row: 0, text: "代码 `", isWrapped: false },
++      { row: 1, text: "$x^2$` 后面 $z^2$", isWrapped: true }
++    ], 40, false, true);
++    expect(snapshot.formulas.map((f) => f.formula.latex)).toEqual(["z^2"]);
++  });
++});
+diff --git a/test/transparent-overlay.test.ts b/test/transparent-overlay.test.ts
+new file mode 100644
+index 0000000..4862351
+--- /dev/null
++++ b/test/transparent-overlay.test.ts
+@@ -0,0 +1,237 @@
++import { createRequire } from "node:module";
++import { describe, expect, it, vi } from "vitest";
++import type { Terminal as XtermTerminal } from "@xterm/headless";
++import sharp from "sharp";
++import { FormulaScreen } from "../src/screen.js";
++import { MathRenderer } from "../src/math-renderer.js";
++
++const { Terminal } = createRequire(import.meta.url)("@xterm/headless") as { Terminal: typeof XtermTerminal };
++const capabilities = { kittyGraphics: true, foreground: "#ffffff", background: "#000000",
++  cell: { width: 9, height: 18, source: "cell-query" as const } };
++const formula = "Before\r\n\\[\r\n\\frac{1}{3}\r\n\\]\r\nAfter\r\n";
++
++async function harness(initialRow = 1, renderer = new MathRenderer()) {
++  const terminal = new Terminal({ cols: 80, rows: 12, allowProposedApi: true, reflowCursorLine: true });
++  const uploads: Uint8Array[] = [];
++  const packets: string[] = [];
++  const write = (s: string) => new Promise<void>((resolve) => terminal.write(s, resolve));
++  if (initialRow > 1) await write("Last login\r\n");
++  const screen = new FormulaScreen({ cols: 80, rows: 12,
++    capabilities: { ...capabilities, initialCursor: { row: initialRow, column: 1 } }, scale: 1,
++    transparentBackground: true, strictDetection: true, stabilityMs: 0, renderer,
++    transmitImage: (png, id) => { uploads.push(png); return `\x1b_Ga=t,i=${id};\x1b\\`; },
++    writeOuter: (s) => { packets.push(String(s)); terminal.write(String(s)); },
++    writeGraphics: async (create) => {
++      const s = create(); if (s === undefined) return false;
++      packets.push(String(s)); await write(String(s)); return true;
++    }
++  });
++  return { terminal, screen, uploads, packets,
++    async output(s: string, scan = true) {
++      await write(s); await screen.write(s); if (scan) await screen.flushScan();
++    },
++    async drain() { await write(""); },
++    close() { screen.dispose(); terminal.dispose(); }
++  };
++}
++
++describe("transparent terminal formula overlays", () => {
++  it("keeps lifecycle deletes inside the proxy frame while mirroring an unframed clear", async () => {
++    const h = await harness();
++    try {
++      await h.output("\x1b[?1049h" + formula);
++      h.packets.length = 0;
++      h.screen.setOutputFrameActive(true);
++      await h.output("\x1b[2J\x1b[H\r\n" + formula, false);
++      await h.screen.flushFrameScan(true);
++      expect(h.packets.join("")).toContain("a=p");
++      expect(h.packets.join("")).not.toContain("\x1b[?2026l");
++      expect(h.terminal.buffer.active.getLine(3)!.getCell(0)!.isInvisible()).toBeTruthy();
++    } finally { h.screen.setOutputFrameActive(false); h.close(); }
++  });
++
++  it("joins an in-flight render before releasing a redraw with cached formulas", async () => {
++    const renderer = new MathRenderer();
++    const original = renderer.renderPlacement.bind(renderer);
++    const h = await harness(1, renderer);
++    let release!: () => void;
++    const gate = new Promise<void>((resolve) => { release = resolve; });
++    let started!: () => void;
++    const rendering = new Promise<void>((resolve) => { started = resolve; });
++    try {
++      await h.output("\x1b[?1049h" + formula);
++      vi.spyOn(renderer, "renderPlacement").mockImplementationOnce(async (...args) => {
++        started(); await gate; return original(...args);
++      });
++      await h.output("\x1b[2J\x1b[H" + formula.replace("{1}{3}", "{17}{19}"), false);
++      const background = h.screen.flushScan();
++      await rendering;
++      await h.output("\x1b[?2026h\x1b[2J\x1b[H\r\n" + formula, false);
++      h.packets.length = 0;
++      setTimeout(release, 5);
++      await h.screen.flushFrameScan(false, 80);
++      await h.drain();
++      expect(h.terminal.buffer.active.getLine(3)!.getCell(0)!.isInvisible()).toBeTruthy();
++      expect(h.packets.join("")).toContain("a=p");
++      expect(h.packets.join("")).not.toContain("\x1b[?2026l");
++      await background;
++    } finally { release(); h.close(); }
++  });
++
++  it("releases the frame budget when cold typesetting stalls, then completes asynchronously", async () => {
++    const renderer = new MathRenderer();
++    const original = renderer.renderPlacement.bind(renderer);
++    let release!: () => void;
++    const gate = new Promise<void>((resolve) => { release = resolve; });
++    const render = vi.spyOn(renderer, "renderPlacement").mockImplementationOnce(async (...args) => {
++      await gate; return original(...args);
++    });
++    const h = await harness(1, renderer);
++    try {
++      await h.output("\x1b[?2026h" + formula, false);
++      await h.screen.flushFrameScan(false, 10);
++      expect(render).toHaveBeenCalledOnce();
++      expect(h.uploads).toHaveLength(0);
++      expect(h.terminal.buffer.active.getLine(2)!.getCell(0)!.isInvisible()).toBeFalsy();
++      release();
++      await h.output("\x1b[?2026l");
++      expect(h.terminal.buffer.active.getLine(2)!.getCell(0)!.isInvisible()).toBeTruthy();
++    } finally { release(); h.close(); }
++  });
++
++  it("places cached formulas before frame release without starting cold renders", async () => {
++    const renderer = new MathRenderer();
++    const render = vi.spyOn(renderer, "renderPlacement");
++    const h = await harness(1, renderer);
++    try {
++      await h.output("\x1b[?1049h" + formula);
++      render.mockClear();
++      h.packets.length = 0;
++      // Redraw the same formula at another row inside an application frame.
++      const redraw = "\x1b[?2026h\x1b[2J\x1b[H\r\n" + formula;
++      await new Promise<void>((resolve) => h.terminal.write(redraw, resolve));
++      await h.screen.write(redraw);
++      await h.screen.flushCachedScan();
++      await h.drain();
++      expect(render).not.toHaveBeenCalled();
++      expect(h.packets.join("")).toContain("a=p");
++      expect(h.packets.join("")).not.toContain("\x1b[?2026l");
++      expect(h.terminal.buffer.active.getLine(3)!.getCell(0)!.isInvisible()).toBeTruthy();
++
++      const cold = "\x1b[2J\x1b[H" + formula.replace("{1}{3}", "{77}{91}");
++      await new Promise<void>((resolve) => h.terminal.write(cold, resolve));
++      await h.screen.write(cold);
++      await h.screen.flushCachedScan();
++      expect(render).not.toHaveBeenCalled();
++      expect(h.terminal.buffer.active.getLine(2)!.getCell(0)!.isInvisible()).toBeFalsy();
++      await h.output("\x1b[?2026l");
++      expect(render).toHaveBeenCalled();
++      expect(h.terminal.buffer.active.getLine(2)!.getCell(0)!.isInvisible()).toBeTruthy();
++    } finally { h.close(); }
++  });
++
++  it("accounts for login output printed before the proxy started", async () => {
++    const h = await harness(2);
++    try {
++      await h.output(formula);
++      expect(h.terminal.buffer.active.getLine(0)!.translateToString(true)).toBe("Last login");
++      expect(h.terminal.buffer.active.getLine(1)!.translateToString(true)).toBe("Before");
++      expect(h.terminal.buffer.active.getLine(1)!.getCell(0)!.isInvisible()).toBeFalsy();
++      expect(h.terminal.buffer.active.getLine(3)!.translateToString(true)).toBe("\\frac{1}{3}");
++      expect(h.terminal.buffer.active.getLine(3)!.getCell(0)!.isInvisible()).toBeTruthy();
++      expect(h.terminal.buffer.active.getLine(5)!.translateToString(true)).toBe("After");
++    } finally { h.close(); }
++  });
++  it("keeps PNG backgrounds transparent, conceals source glyphs and preserves copy and cursor", async () => {
++    const h = await harness();
++    try {
++      await h.output(formula);
++      expect(h.uploads.length).toBeGreaterThan(0);
++      const { data, info } = await sharp(h.uploads[0]!).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
++      expect(info.channels).toBe(4);
++      expect(data[3]).toBe(0);
++      expect(data[(info.width * info.height - 1) * 4 + 3]).toBe(0);
++      expect(h.terminal.buffer.active.getLine(1)!.translateToString(true)).toBe("\\[");
++      expect(h.terminal.buffer.active.getLine(2)!.translateToString(true)).toBe("\\frac{1}{3}");
++      expect(h.terminal.buffer.active.getLine(2)!.getCell(0)!.isInvisible()).toBeTruthy();
++      expect(h.terminal.buffer.active.getLine(0)!.getCell(0)!.isInvisible()).toBeFalsy();
++      expect(h.terminal.buffer.active.getLine(4)!.getCell(0)!.isInvisible()).toBeFalsy();
++      expect(h.terminal.buffer.active.cursorX).toBe(h.screen.terminal.buffer.active.cursorX);
++      expect(h.terminal.buffer.active.cursorY).toBe(h.screen.terminal.buffer.active.cursorY);
++      await h.output("typed text");
++      expect(h.terminal.buffer.active.getLine(5)!.translateToString(true)).toBe("typed text");
++      expect(h.terminal.buffer.active.getLine(5)!.getCell(0)!.isInvisible()).toBeFalsy();
++    } finally { h.close(); }
++  });
++
++  it("reconceals an unchanged formula after a TUI redraw, then restores it on graphics rejection", async () => {
++    const h = await harness();
++    try {
++      await h.output("\x1b[?1049h\x1b[H" + formula);
++      await h.output("\x1b[3;1H\\frac{1}{3}\x1b[6;1H");
++      expect(h.terminal.buffer.active.getLine(2)!.getCell(0)!.isInvisible()).toBeTruthy();
++      const packet = h.packets.findLast((s) => s.includes("a=p"))!;
++      const imageId = Number(packet.match(/a=p,i=(\d+)/)![1]);
++      expect(h.screen.invalidateTerminalImage(imageId, "test rejection", false)).toBe(true);
++      await h.screen.flushScan(); await h.drain();
++      expect(h.terminal.buffer.active.getLine(2)!.getCell(0)!.isInvisible()).toBeFalsy();
++      expect(h.terminal.buffer.active.getLine(2)!.translateToString(true)).toBe("\\frac{1}{3}");
++    } finally { h.close(); }
++  });
++
++  it("restores source on reset and never conceals replacement prose", async () => {
++    const h = await harness();
++    try {
++      await h.output(formula);
++      h.screen.resetPlacements(); await h.drain();
++      expect(h.terminal.buffer.active.getLine(2)!.getCell(0)!.isInvisible()).toBeFalsy();
++      await h.output("\x1b[2J\x1b[Hreplacement prose");
++      expect(h.terminal.buffer.active.getLine(0)!.translateToString(true)).toBe("replacement prose");
++      expect(h.terminal.buffer.active.getLine(0)!.getCell(0)!.isInvisible()).toBeFalsy();
++    } finally { h.close(); }
++  });
++
++  it("preserves application cursor-save slots and pen colors", async () => {
++    const h = await harness();
++    try {
++      await h.output("\x1b[32m\x1b[7;8H\x1b7\x1b[H" + formula);
++      await h.output("\x1b8Z");
++      const z = h.terminal.buffer.active.getLine(6)!.getCell(7)!;
++      expect(z.getChars()).toBe("Z");
++      expect(z.isInvisible()).toBeFalsy();
++      expect(z.isFgPalette()).toBeTruthy();
++      expect(z.getFgColor()).toBe(2);
++    } finally { h.close(); }
++  });
++
++  it("keeps source characters intact through resize, scrollback and alternate-screen switches", async () => {
++    const h = await harness();
++    try {
++      await h.output(formula);
++      h.terminal.resize(40, 12); h.screen.resize(40, 12);
++      await h.screen.flushScan();
++      expect(h.terminal.buffer.active.getLine(2)!.translateToString(true)).toBe("\\frac{1}{3}");
++      expect(h.terminal.buffer.active.getLine(2)!.getCell(0)!.isInvisible()).toBeTruthy();
++      await h.output("\r\n".repeat(15));
++      expect(h.terminal.buffer.active.getLine(2)!.translateToString(true)).toBe("\\frac{1}{3}");
++      await h.output("\x1b[?1049h\x1b[H" + formula);
++      expect(h.terminal.buffer.active.getLine(2)!.getCell(0)!.isInvisible()).toBeTruthy();
++      await h.output("\x1b[?1049lplain prompt");
++      const buffer = h.terminal.buffer.active;
++      const line = buffer.getLine(buffer.baseY + buffer.cursorY)!;
++      expect(line.translateToString(true)).toContain("plain prompt");
++      expect(line.getCell(0)!.isInvisible()).toBeFalsy();
++    } finally { h.close(); }
++  });
++
++  it("conceals inline TeX without changing adjacent Unicode prose or source copying", async () => {
++    const h = await harness();
++    try {
++      const line = "中文： $\\frac{a}{b}$ 后续文字。";
++      await h.output(line + "\r\n");
++      expect(h.terminal.buffer.active.getLine(0)!.translateToString(true)).toBe(line);
++      expect(h.terminal.buffer.active.getLine(0)!.getCell(0)!.isInvisible()).toBeFalsy();
++      expect(h.packets.join("")).toContain("\x1b[8m");
++    } finally { h.close(); }
++  });
++});

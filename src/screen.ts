@@ -1,0 +1,3080 @@
+import { createHash, randomInt } from "node:crypto";
+import { createRequire } from "node:module";
+import type {
+  IBufferCell,
+  IBufferLine,
+  IMarker,
+  ITerminalAddon,
+  Terminal as XtermTerminal
+} from "@xterm/headless";
+import { containsFormulaTrigger, MAX_DISPLAY_BLOCK_ROWS } from "./detect.js";
+import { planFormulaPlacements } from "./formula-layout.js";
+import {
+  mathJaxContainerWidthForPlacement,
+  MathRenderError,
+  MathRenderer,
+  type MathRenderFailureCode
+} from "./math-renderer.js";
+import {
+  cursorPosition,
+  kittyDeleteByZIndex,
+  kittyDeleteImage,
+  kittyDeletePlacement,
+  kittyPlaceImage,
+  kittyTransmitImage,
+  synchronizedOutput,
+  TFORMULA_FOCUS_Z_INDEX,
+  TFORMULA_IMAGE_ID_MAX,
+  TFORMULA_IMAGE_ID_MIN
+} from "./kitty.js";
+import { detectScreenFormulaRegions } from "./screen-text.js";
+import type {
+  FormulaPlacementPlan,
+  FormulaRenderedEvent,
+  RecentFormulaEntry,
+  TerminalCapabilities
+} from "./types.js";
+
+const { Terminal } = createRequire(import.meta.url)("@xterm/headless") as {
+  Terminal: typeof XtermTerminal;
+};
+const { UnicodeGraphemesAddon } = createRequire(import.meta.url)(
+  "@xterm/addon-unicode-graphemes"
+) as {
+  UnicodeGraphemesAddon: new () => ITerminalAddon;
+};
+
+interface FocusPlacement {
+  imageId: number;
+  placementId: number;
+}
+
+interface PlannedFormulaSnapshot {
+  regions: FormulaPlacementPlan[];
+  deferred: Array<{ latex: string; startRow: number; endRow: number }>;
+}
+
+interface PlacedFormula {
+  transparentCanvas?: { startCol: number; endCol: number };
+  anchor: string;
+  imageId: number;
+  placementId: number;
+  imageKey: string;
+  latex: string;
+  sourceText: string;
+  fingerprint: string;
+  /** Resize generation in which this cell-addressed placement was emitted. */
+  resizeGeneration: number;
+  bufferType: string;
+  absoluteStartRow: number;
+  absoluteEndRow: number;
+  startMarker?: IMarker;
+  endMarker?: IMarker;
+  /** Last known visible bounds, retained only until a resize replacement. */
+  layoutHint?: { start: number; end: number };
+  /** Normal-buffer trim generation at which layoutHint was captured. */
+  layoutHintTrimGeneration?: number;
+}
+
+interface TerminalImage {
+  imageId: number;
+  placements: number;
+  lastUsed: number;
+}
+
+interface FormulaStabilityState {
+  firstSeenAt: number;
+  stable: boolean;
+}
+
+const DEFAULT_MAX_TERMINAL_IMAGES = 256;
+const DEFAULT_MAX_DETACHED_PLACEMENTS = 4_096;
+const MIRROR_SCROLLBACK_ROWS = 10_000;
+const MAX_UNPARSEABLE_FORMULAS = 4_096;
+/**
+ * Render failures decided by the LaTeX source alone. The raster codes are
+ * deliberately absent: raster-limit, empty-raster and png-limit depend on the
+ * canvas geometry, cell metrics and scale rather than the source, and
+ * raster-error reports a crashed or timed-out rasterizer process, which a
+ * retry can legitimately clear. renderer-unavailable is absent for the same
+ * reason: it reports MathJax failing to run rather than failing on the input,
+ * so it must keep its place on the retry ladder. Membership here is permanent
+ * for the session, so a code only belongs if it is reproducible from the
+ * source; anything a second attempt could clear must stay out.
+ */
+const SOURCE_DETERMINED_RENDER_FAILURES = new Set<MathRenderFailureCode>([
+  "input-too-long",
+  "disabled-command",
+  "tex-error",
+  "invalid-svg"
+]);
+
+interface MutableXtermBufferCursor {
+  x: number;
+  y: number;
+  ybase: number;
+}
+
+/**
+ * Runtime shape shared by xterm's CellData and current AttrData objects.
+ *
+ * The public buffer-cell API intentionally omits a few rendition fields. We
+ * feature-detect the pinned @xterm/headless 6.x shape before using it, and
+ * simply defer placement if a future xterm release changes that shape.
+ */
+interface XtermRendition {
+  fg: number;
+  bg: number;
+  extended: {
+    _ext: number;
+    _urlId: number;
+  };
+  isInverse(): number;
+  isBold(): number;
+  isUnderline(): number;
+  isBlink(): number;
+  isInvisible(): number;
+  isItalic(): number;
+  isDim(): number;
+  isStrikethrough(): number;
+  isProtected(): number;
+  isOverline(): number;
+  getFgColorMode(): number;
+  getBgColorMode(): number;
+  isFgRGB(): boolean;
+  isBgRGB(): boolean;
+  isFgPalette(): boolean;
+  isBgPalette(): boolean;
+  isFgDefault(): boolean;
+  isBgDefault(): boolean;
+  getFgColor(): number;
+  getBgColor(): number;
+  getUnderlineColor(): number;
+  getUnderlineColorMode(): number;
+  isUnderlineColorRGB(): boolean;
+  isUnderlineColorPalette(): boolean;
+  isUnderlineColorDefault(): boolean;
+  getUnderlineStyle(): number;
+  getUnderlineVariantOffset(): number;
+}
+
+interface XtermPrivateCore {
+  _inputHandler?: { _curAttrData?: Partial<XtermRendition> };
+  _charsetService?: { glevel?: number; _charsets?: unknown[] };
+}
+
+const XTERM_COLOR_P16 = 0x01_00_00_00;
+const XTERM_COLOR_P256 = 0x02_00_00_00;
+const XTERM_COLOR_RGB = 0x03_00_00_00;
+
+function xtermPrivateCore(terminal: XtermTerminal): XtermPrivateCore | undefined {
+  return (terminal as unknown as { _core?: XtermPrivateCore })._core;
+}
+
+function isXtermRendition(value: unknown): value is XtermRendition {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<XtermRendition>;
+  return typeof candidate.fg === "number"
+    && typeof candidate.bg === "number"
+    && Boolean(candidate.extended)
+    && typeof candidate.extended?._ext === "number"
+    && typeof candidate.extended?._urlId === "number"
+    && typeof candidate.isProtected === "function"
+    && typeof candidate.getUnderlineStyle === "function"
+    && typeof candidate.getUnderlineColorMode === "function"
+    && typeof candidate.getUnderlineVariantOffset === "function";
+}
+
+function xtermUsesDefaultCharset(terminal: XtermTerminal): boolean {
+  const charset = xtermPrivateCore(terminal)?._charsetService;
+  return charset?.glevel === 0
+    && Array.isArray(charset._charsets)
+    && charset._charsets.every((value) => value === undefined || value === null);
+}
+
+function sameXtermStyle(left: XtermRendition, right: XtermRendition): boolean {
+  // DECSCA protection is terminal state but not part of SGR. Mask its xterm
+  // storage bit so a protection-only change does not needlessly reset style.
+  const protectedBit = 0x20_00_00_00;
+  return left.fg === right.fg
+    && (left.bg & ~protectedBit) === (right.bg & ~protectedBit)
+    && left.extended._ext === right.extended._ext
+    && left.extended._urlId === right.extended._urlId;
+}
+
+function paletteSgr(
+  target: "foreground" | "background",
+  mode: number,
+  value: number
+): string | undefined {
+  const normalized = Math.max(0, Math.min(255, Math.floor(value)));
+  if (mode === XTERM_COLOR_P16) {
+    if (normalized > 15) return undefined;
+    if (target === "foreground") {
+      return String(normalized < 8 ? 30 + normalized : 90 + normalized - 8);
+    }
+    return String(normalized < 8 ? 40 + normalized : 100 + normalized - 8);
+  }
+  if (mode !== XTERM_COLOR_P256) return undefined;
+  return `${target === "foreground" ? 38 : 48};5;${normalized}`;
+}
+
+/** Encode a complete rendition from a known reset state. */
+function xtermRenditionSgr(rendition: XtermRendition): string | undefined {
+  // xterm tracks only one blink bit, so serializing it could silently turn a
+  // rapid blink into a slow one. This path is a correctness fallback, not a
+  // reason to alter unusual application styling.
+  if (rendition.isBlink()) return undefined;
+  const underlineVariantOffset = rendition.getUnderlineVariantOffset();
+  if (underlineVariantOffset !== 0) return undefined;
+
+  const parameters = ["0"];
+  if (rendition.isBold()) parameters.push("1");
+  if (rendition.isDim()) parameters.push("2");
+  if (rendition.isItalic()) parameters.push("3");
+  const underlineStyle = rendition.getUnderlineStyle();
+  if (underlineStyle < 0 || underlineStyle > 5) return undefined;
+  if (underlineStyle > 0) parameters.push(`4:${underlineStyle}`);
+  if (rendition.isInverse()) parameters.push("7");
+  if (rendition.isInvisible()) parameters.push("8");
+  if (rendition.isStrikethrough()) parameters.push("9");
+  if (rendition.isOverline()) parameters.push("53");
+
+  const foregroundMode = rendition.getFgColorMode();
+  if (rendition.isFgRGB()) {
+    const color = rendition.getFgColor();
+    parameters.push(`38;2;${color >>> 16 & 0xff};${color >>> 8 & 0xff};${color & 0xff}`);
+  } else if (rendition.isFgPalette()) {
+    const encoded = paletteSgr("foreground", foregroundMode, rendition.getFgColor());
+    if (!encoded) return undefined;
+    parameters.push(encoded);
+  } else if (!rendition.isFgDefault()) return undefined;
+
+  const backgroundMode = rendition.getBgColorMode();
+  if (rendition.isBgRGB()) {
+    const color = rendition.getBgColor();
+    parameters.push(`48;2;${color >>> 16 & 0xff};${color >>> 8 & 0xff};${color & 0xff}`);
+  } else if (rendition.isBgPalette()) {
+    const encoded = paletteSgr("background", backgroundMode, rendition.getBgColor());
+    if (!encoded) return undefined;
+    parameters.push(encoded);
+  } else if (!rendition.isBgDefault()) return undefined;
+
+  if (underlineStyle > 0 && !rendition.isUnderlineColorDefault()) {
+    const underlineColor = rendition.getUnderlineColor();
+    const underlineMode = rendition.getUnderlineColorMode();
+    if (rendition.isUnderlineColorRGB()) {
+      parameters.push(
+        `58;2;${underlineColor >>> 16 & 0xff};`
+        + `${underlineColor >>> 8 & 0xff};${underlineColor & 0xff}`
+      );
+    } else if (rendition.isUnderlineColorPalette()
+      && (underlineMode === XTERM_COLOR_P16 || underlineMode === XTERM_COLOR_P256)) {
+      parameters.push(`58;5;${Math.max(0, Math.min(255, Math.floor(underlineColor)))}`);
+    } else return undefined;
+  }
+  return `\x1b[${parameters.join(";")}m`;
+}
+
+interface CursorLineReflowSnapshot {
+  bufferType: string;
+  /** Normal-buffer marker at the start of the wrapped logical line. */
+  startMarker?: IMarker;
+}
+
+function lineTrimmedColumns(line: IBufferLine): number {
+  for (let column = line.length - 1; column >= 0; column -= 1) {
+    const cell = line.getCell(column);
+    // A width-zero cell is the occupied second half of a wide grapheme. Null
+    // cells have no characters and width one; printed spaces retain " ".
+    if (cell && (cell.getChars().length > 0 || cell.getWidth() === 0)) {
+      return column + 1;
+    }
+  }
+  return 0;
+}
+
+function mutableXtermBufferCursor(
+  terminal: XtermTerminal
+): MutableXtermBufferCursor | undefined {
+  // xterm exposes cursorX/Y as read-only. Version 6.0.0 has an upstream
+  // reflowCursorLine bug that requires narrowly feature-detected access to the
+  // active internal buffer; if its private shape changes, safely do nothing.
+  const candidate = (terminal as unknown as {
+    _core?: { _bufferService?: { buffer?: Partial<MutableXtermBufferCursor> } };
+  })._core?._bufferService?.buffer;
+  if (!candidate
+    || typeof candidate.x !== "number"
+    || typeof candidate.y !== "number"
+    || typeof candidate.ybase !== "number") return undefined;
+  return candidate as MutableXtermBufferCursor;
+}
+
+/**
+ * DECSTBM margins of the active buffer, in viewport rows.
+ *
+ * xterm keeps them private, and a scroll outside the region moves nothing, so
+ * a TUI that reserves a bottom pane never disturbs the rows above it. If the
+ * private shape ever changes, report no margins and let the caller fall back
+ * to treating the whole screen as scrolled — the old, conservative behaviour.
+ */
+function xtermScrollMargins(
+  terminal: XtermTerminal
+): { top: number; bottom: number } | undefined {
+  const buffer = (terminal as unknown as {
+    _core?: { _bufferService?: { buffer?: { scrollTop?: unknown; scrollBottom?: unknown } } };
+  })._core?._bufferService?.buffer;
+  const top = buffer?.scrollTop;
+  const bottom = buffer?.scrollBottom;
+  if (typeof top !== "number" || typeof bottom !== "number") return undefined;
+  if (!Number.isInteger(top) || !Number.isInteger(bottom) || top < 0 || bottom < top) {
+    return undefined;
+  }
+  return { top, bottom };
+}
+
+function rgbHex(value: number): string {
+  return `#${value.toString(16).padStart(6, "0").slice(-6)}`;
+}
+
+function paletteHex(index: number): string {
+  const base = [
+    "#000000", "#cd0000", "#00cd00", "#cdcd00",
+    "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
+    "#7f7f7f", "#ff0000", "#00ff00", "#ffff00",
+    "#5c5cff", "#ff00ff", "#00ffff", "#ffffff"
+  ];
+  if (index < base.length) return base[Math.max(0, index)]!;
+  if (index >= 232) {
+    const level = Math.max(0, Math.min(255, 8 + (index - 232) * 10));
+    return rgbHex((level << 16) | (level << 8) | level);
+  }
+  const value = Math.max(0, Math.min(215, index - 16));
+  const levels = [0, 95, 135, 175, 215, 255];
+  const red = levels[Math.floor(value / 36)]!;
+  const green = levels[Math.floor(value / 6) % 6]!;
+  const blue = levels[value % 6]!;
+  return rgbHex((red << 16) | (green << 8) | blue);
+}
+
+function cellStyleKey(cell: IBufferCell): string {
+  return [
+    cell.getFgColorMode(), cell.getFgColor(),
+    cell.getBgColorMode(), cell.getBgColor(),
+    cell.isBold(), cell.isDim(), cell.isItalic(), cell.isUnderline(),
+    cell.isBlink(), cell.isInverse(), cell.isInvisible(),
+    cell.isStrikethrough(), cell.isOverline()
+  ].join(":");
+}
+
+function cellsHaveSameStyle(left: IBufferCell, right: IBufferCell): boolean {
+  return left.getFgColorMode() === right.getFgColorMode()
+    && left.getFgColor() === right.getFgColor()
+    && left.getBgColorMode() === right.getBgColorMode()
+    && left.getBgColor() === right.getBgColor()
+    && left.isBold() === right.isBold()
+    && left.isDim() === right.isDim()
+    && left.isItalic() === right.isItalic()
+    && left.isUnderline() === right.isUnderline()
+    && left.isBlink() === right.isBlink()
+    && left.isInverse() === right.isInverse()
+    && left.isInvisible() === right.isInvisible()
+    && left.isStrikethrough() === right.isStrikethrough()
+    && left.isOverline() === right.isOverline();
+}
+
+function lineTextSnapshot(line: IBufferLine | undefined, translatedText?: string): {
+  text: string;
+  columnMap?: number[];
+  cellColumns?: number;
+  styleKey?: string;
+  uniformStyle?: boolean;
+} {
+  if (!line) return { text: "" };
+  const endColumn = lineTrimmedColumns(line);
+  let text = "";
+  const columnMap: number[] = [0];
+  let firstStyledCell: IBufferCell | undefined;
+  let uniformStyle = true;
+  for (let column = 0; column < endColumn; column += 1) {
+    const cell = line.getCell(column);
+    if (!cell || cell.getWidth() === 0) continue;
+    const chars = cell.getChars() || " ";
+    const startIndex = text.length;
+    columnMap[startIndex] = column;
+    text += chars;
+    for (let offset = 1; offset < chars.length; offset += 1) {
+      columnMap[startIndex + offset] = column + cell.getWidth();
+    }
+    columnMap[text.length] = column + cell.getWidth();
+    if (cell.getChars()) {
+      if (!firstStyledCell) firstStyledCell = cell;
+      else if (uniformStyle && !cellsHaveSameStyle(firstStyledCell, cell)) uniformStyle = false;
+    }
+  }
+  // Keep the public xterm translation as the text oracle. The cell walk above
+  // should match it, but feature-detect a future xterm representation change
+  // and safely fall back to string-based columns rather than using a bad map.
+  const translated = translatedText ?? line.translateToString(true);
+  if (translated !== text) return { text: translated };
+  return {
+    text,
+    columnMap,
+    cellColumns: endColumn,
+    uniformStyle,
+    styleKey: uniformStyle && firstStyledCell ? cellStyleKey(firstStyledCell) : undefined
+  };
+}
+
+export class FormulaScreen {
+  readonly terminal: XtermTerminal;
+  readonly #renderer: MathRenderer;
+  readonly #strictDetection: boolean;
+  readonly #presentation?: XtermTerminal;
+  readonly #transmitImage: (png: Uint8Array, imageId: number) => string;
+  readonly #placed = new Map<string, PlacedFormula>();
+  /**
+   * Normal-buffer pins which Ghostty still owns after xterm lost both markers.
+   * They deliberately have no coordinate key: xterm absolute rows recycle at
+   * its scrollback cap and must never match a later, unrelated formula.
+   */
+  readonly #detachedPlacements = new Map<string, PlacedFormula>();
+  readonly #terminalImages = new Map<string, TerminalImage>();
+  /**
+   * Images whose only placements a relayout just dropped. They are protected
+   * from idle eviction until the scan that re-places them has reconciled the
+   * screen, so a scrolling TUI never re-uploads a formula it still shows.
+   */
+  readonly #relayoutPendingImageKeys = new Set<string>();
+  readonly #allocatedImageIds = new Set<number>();
+  readonly #blockedImageKeys = new Set<string>();
+  readonly #imageRetries = new Map<string, { attempt: number; notBefore: number }>();
+  readonly #blockedPlacementKeys = new Set<string>();
+  /**
+   * Sources whose render failure is decided by the LaTeX alone, keyed by
+   * content. The coordinate-keyed ladder cannot hold this: a failed render
+   * schedules the next scan itself, and #invalidateDirtyAlternatePlacements
+   * drops the alternate-screen retry entries whenever a scroll moves the
+   * layout, so the attempt counter never reaches the ceiling that would add
+   * the key to #blockedPlacementKeys. A TUI that scrolls while a placement is
+   * on screen therefore re-attempts the same text forever (a real session
+   * mis-detected prose as TeX and failed to parse it 865 times). The outcome
+   * depends only on the source, so these keys deliberately survive repaint,
+   * resize, clear and scale changes.
+   */
+  readonly #unparseableFormulaKeys = new Set<string>();
+  readonly #placementRetries = new Map<string, { attempt: number; notBefore: number }>();
+  readonly #formulaStability = new Map<string, FormulaStabilityState>();
+  readonly #recentFormulas: RecentFormulaEntry[] = [];
+  readonly #recentFormulaLimit = 50;
+  #recentFormulaId = 1;
+  #focusIndex = -1;
+  #focusPlacement?: FocusPlacement;
+  #focusDirty = false;
+  readonly #writeOuter: (data: string | Uint8Array) => void;
+  readonly #writeGraphics?: (
+    create: () => string | Uint8Array | undefined
+  ) => Promise<boolean>;
+  readonly #debug: (message: string) => void;
+  readonly #onFormulaRendered?: (event: FormulaRenderedEvent) => void;
+  readonly #preserveImagesOnClear: boolean;
+  readonly #maxTerminalImages: number;
+  readonly #maxDetachedPlacements: number;
+  readonly #minReadableScale: number;
+  readonly #stabilityMs: number;
+  #capabilities: TerminalCapabilities;
+  #scale: number;
+  #imageId = TFORMULA_IMAGE_ID_MIN;
+  #imageUse = 0;
+  #placementId = 1;
+  #scanTimer?: NodeJS.Timeout;
+  #scanTimerDueAt = 0;
+  #scanTimerRetryOnly = false;
+  #scanVersion = 0;
+  #layoutVersion = 0;
+  #resizeGeneration = 0;
+  #scanning = false;
+  #cachedScanMiss = false;
+  #rescanRequested = false;
+  readonly #scanWaiters: Array<() => void> = [];
+  #pendingWrites = 0;
+  readonly #writeWaiters: Array<() => void> = [];
+  #layoutEpoch = 0;
+  #layoutSuspended = false;
+  readonly #layoutWaiters: Array<() => void> = [];
+  /**
+   * Viewport rows an alternate-screen scroll may have moved, or undefined when
+   * the alternate layout is trusted. Ghostty moves a Kitty pin together with
+   * the cells it covers, so only pins inside this band lost their coordinates;
+   * a TUI repainting a bottom pane must not cost the transcript its images.
+   */
+  #alternateDirtyRows?: { start: number; end: number };
+  #alternate47Restored = false;
+  #pendingWrapHeldColumns?: number;
+  #graphicsSynchronizedOutputOverride?: boolean;
+  #outputFrameActive = false;
+  #normalTrimGeneration = 0;
+  #resizing = false;
+  #disposed = false;
+  #controlTail = "";
+  #regionValidationCache?: {
+    version: number;
+    viewportY: number;
+    bufferType: string;
+    identities: Set<string>;
+  };
+
+  constructor(options: {
+    cols: number;
+    rows: number;
+    capabilities: TerminalCapabilities;
+    scale: number;
+    minReadableScale?: number;
+    stabilityMs?: number;
+    transparentBackground?: boolean;
+    strictDetection?: boolean;
+    writeOuter: (data: string | Uint8Array) => void;
+    writeGraphics?: (
+      create: () => string | Uint8Array | undefined
+    ) => Promise<boolean>;
+    debug?: (message: string) => void;
+    onFormulaRendered?: (event: FormulaRenderedEvent) => void;
+    renderer?: MathRenderer;
+    transmitImage?: (png: Uint8Array, imageId: number) => string;
+    preserveImagesOnClear?: boolean;
+    maxTerminalImages?: number;
+    maxDetachedPlacements?: number;
+  }) {
+    this.terminal = new Terminal({
+      cols: options.cols,
+      rows: options.rows,
+      scrollback: MIRROR_SCROLLBACK_ROWS,
+      allowProposedApi: true,
+      // Agent responses commonly end with a formula and no trailing newline.
+      // Without this xterm option, shrinking the terminal truncates the active
+      // cursor line in the mirror, making a complete formula disappear from
+      // detection even though Ghostty reflows it on screen.
+      reflowCursorLine: true
+    });
+    // Match modern terminal grapheme widths (emoji, variation selectors and
+    // ZWJ families). Wrong cell widths corrupt both formula anchors and the
+    // cursor position restored after a Kitty placement.
+    this.terminal.loadAddon(new UnicodeGraphemesAddon());
+    this.#strictDetection = Boolean(options.strictDetection);
+    if (options.transparentBackground) {
+      this.#presentation = new Terminal({
+        cols: options.cols, rows: options.rows, scrollback: MIRROR_SCROLLBACK_ROWS,
+        allowProposedApi: true, reflowCursorLine: true
+      });
+      this.#presentation.loadAddon(new UnicodeGraphemesAddon());
+      // Transparent scrollback images outlive the proxy. Avoid reusing their
+      // IDs or deleting their pins when another proxy starts in this terminal.
+      this.#imageId = randomInt(TFORMULA_IMAGE_ID_MIN, TFORMULA_IMAGE_ID_MAX);
+    }
+    if (options.capabilities.initialCursor) {
+      const { row, column } = options.capabilities.initialCursor;
+      const initialPosition = cursorPosition(row, column);
+      this.terminal.write(initialPosition);
+      this.#presentation?.write(initialPosition);
+    }
+    this.#capabilities = options.capabilities;
+    this.#scale = options.scale;
+    this.#minReadableScale = Number.isFinite(options.minReadableScale)
+      ? Math.max(0, Math.min(1, options.minReadableScale!))
+      : 0.4;
+    this.#stabilityMs = Number.isFinite(options.stabilityMs)
+      ? Math.max(0, Math.min(2_000, Math.floor(options.stabilityMs!)))
+      : 80;
+    this.#renderer = options.renderer ?? new MathRenderer();
+    this.#transmitImage = options.transmitImage ?? kittyTransmitImage;
+    this.#writeOuter = options.writeOuter;
+    this.#writeGraphics = options.writeGraphics;
+    this.#debug = options.debug ?? (() => undefined);
+    this.#onFormulaRendered = options.onFormulaRendered;
+    this.#preserveImagesOnClear = options.preserveImagesOnClear ?? false;
+    this.#maxTerminalImages = Math.max(
+      1,
+      Math.floor(options.maxTerminalImages ?? DEFAULT_MAX_TERMINAL_IMAGES)
+    );
+    // Detached placements outlive xterm's 10k-row mirror, so marker disposal
+    // cannot bound them. Their budget is intentionally independent from image
+    // count: thousands of identical formulas share one upload and should keep
+    // their rendered scrollback, while unique images are bounded separately.
+    this.#maxDetachedPlacements = Math.max(
+      0,
+      Math.floor(options.maxDetachedPlacements ?? DEFAULT_MAX_DETACHED_PLACEMENTS)
+    );
+    if (this.#capabilities.kittyGraphics && !this.#presentation) {
+      // A previous TFormula process may have crashed before dispose(). Image
+      // ids restart per process, so remove only our dedicated z-index before
+      // the first upload can accidentally rebind an orphaned placement.
+      this.#writeGraphicsTransaction(kittyDeleteByZIndex());
+    }
+    this.terminal.buffer.onBufferChange(() => {
+      // Buffer-specific invalidation is driven by the actual mode sequences in
+      // write(). Merely switching back to the primary screen must not discard
+      // its placements: Ghostty restores that screen and its image storage.
+      this.#layoutVersion += 1;
+      this.#scanVersion += 1;
+      if (!this.#layoutSuspended) this.scheduleScan(16);
+    });
+    this.terminal.onScroll(() => {
+      const buffer = this.terminal.buffer.active;
+      if (!this.#resizing
+        && buffer.type === "normal"
+        && buffer.baseY >= MIRROR_SCROLLBACK_ROWS) {
+        // Once baseY saturates, xterm recycles the same absolute row numbers.
+        // onScroll still fires for each real trim, giving resize hints a way to
+        // prove that their old static coordinates are no longer authoritative.
+        this.#normalTrimGeneration += 1;
+      }
+      // The alternate screen has no scrollback and xterm does not expose
+      // markers there. Even though its viewportY stays zero, a bottom-margin
+      // scroll changes every Kitty cell pin's row identity.
+      this.#markAlternateLayoutDirty(false, this.#scrollRegionRows());
+    });
+    for (const final of ["S", "T"]) {
+      this.terminal.parser.registerCsiHandler({ final }, () => {
+        this.#markAlternateLayoutDirty(false, this.#scrollRegionRows());
+        return false;
+      });
+    }
+    for (const final of ["L", "M"]) {
+      this.terminal.parser.registerCsiHandler({ final }, () => {
+        // Custom CSI handlers run before xterm's own, so the cursor is still at
+        // the insert/delete row. Those operations shift the rows from there to
+        // the bottom margin and cannot touch anything above the cursor, which
+        // is how a TUI redraws its input box without moving the transcript.
+        const region = this.#scrollRegionRows();
+        this.#markAlternateLayoutDirty(false, region && {
+          start: Math.max(region.start, this.terminal.buffer.active.cursorY),
+          end: region.end
+        });
+        return false;
+      });
+    }
+    for (const final of ["D", "E", "M"]) {
+      this.terminal.parser.registerEscHandler({ final }, () => {
+        this.#markAlternateLayoutDirty(false, this.#scrollRegionRows());
+        return false;
+      });
+    }
+  }
+
+  queueWrite(): void {
+    this.queueWrites(1);
+  }
+
+  queueWrites(count: number): void {
+    const reservations = Math.max(0, Math.floor(count));
+    if (reservations === 0) return;
+    this.#pendingWrites += reservations;
+    this.#scanVersion += 1;
+    this.#rescanRequested = true;
+  }
+
+  cancelQueuedWrite(): void {
+    this.#completeWrite();
+  }
+
+  async write(
+    data: string,
+    alreadyQueued = false,
+    preservedEraseDisplayOffsets: readonly number[] = []
+  ): Promise<void> {
+    if (this.#focusIndex >= 0 && data) this.#focusDirty = true;
+    if (!alreadyQueued) this.queueWrite();
+    if (this.#controlTail === ""
+      && preservedEraseDisplayOffsets.length === 0
+      && data.indexOf("\x1b") < 0
+      && data.indexOf("\u009b") < 0) {
+      try {
+        await this.#writeTerminal(data);
+      } finally {
+        this.#completeWrite();
+      }
+      return;
+    }
+    const initialBufferType = this.terminal.buffer.active.type;
+    const controls = this.#controlTail + data;
+    this.#controlTail = this.#incompleteControlSuffix(controls);
+    try {
+      let cursor = 0;
+      const offsets = Array.from(new Set(preservedEraseDisplayOffsets))
+        .filter((offset) => Number.isInteger(offset) && offset >= 0 && offset <= data.length)
+        .sort((left, right) => left - right);
+      for (const offset of offsets) {
+        // Advance the mirror to the exact buffer and viewport in which this
+        // rewritten ED 2 occurred before reconciling its image placements.
+        await this.#writeTerminal(data.slice(cursor, offset));
+        if (this.#preserveImagesOnClear) {
+          this.#forgetVisiblePlacementsRetainingImages();
+          this.#debug(`terminal text clear retained ${this.terminal.buffer.active.type} scrollback formula images`);
+        }
+        cursor = offset;
+      }
+      await this.#writeTerminal(data.slice(cursor));
+      // Unrewritten ED 2/3 and screen switches still have their native Kitty
+      // lifecycle. Parse them after xterm has consumed the bytes; the initial
+      // buffer type keeps multiple switches in one write ordered correctly.
+      this.#applyImageLifecycleControls(controls, initialBufferType);
+    } finally {
+      this.#completeWrite();
+    }
+  }
+
+  async #writeTerminal(data: string): Promise<void> {
+    if (!data) return Promise.resolve();
+    await Promise.all([
+      new Promise<void>((resolve) => this.terminal.write(data, resolve)),
+      this.#writePresentation(data)
+    ]);
+  }
+
+  #writePresentation(data: string): Promise<void> {
+    if (!this.#presentation || !data) return Promise.resolve();
+    // Graphics do not change terminal cells; avoid parsing large PNG payloads.
+    const cells = data.replace(/\x1b_G[^\x1b]*\x1b\\/gu, "");
+    return new Promise((resolve) => this.#presentation!.write(cells, resolve));
+  }
+
+  /** Repaint only character attributes, retaining the original copyable text. */
+  #sourceVisibility(plan?: FormulaPlacementPlan, restoreAll = false): string | undefined {
+    if (!this.#presentation) return "";
+    const buffer = this.terminal.buffer.active;
+    const shown = this.#presentation.buffer.active;
+    if (buffer.type !== shown.type || this.terminal.modes.originMode
+      || this.terminal.modes.insertMode || !xtermUsesDefaultCharset(this.terminal)) return undefined;
+    const pen = xtermPrivateCore(this.terminal)?._inputHandler?._curAttrData;
+    if (!isXtermRendition(pen) || pen.extended._urlId !== 0) return undefined;
+    const penSgr = xtermRenditionSgr(pen);
+    const cursor = this.#cursorRestoreAfterGraphics();
+    if (!penSgr || !cursor) return undefined;
+    const ranges = plan
+      ? (plan.sourceMasks.length ? plan.sourceMasks : Array.from(
+          { length: plan.canvas.endRow - plan.canvas.startRow + 1 }, (_, rowOffset) => ({
+            rowOffset, startCol: 0,
+            endCol: plan.canvas.endCol - plan.canvas.startCol, logicalStartCol: 0
+          })
+        )).map((s) => ({ row: plan.canvas.startRow + s.rowOffset,
+          start: plan.canvas.startCol + s.startCol, end: plan.canvas.startCol + s.endCol }))
+      : Array.from({ length: this.terminal.rows }, (_, row) => ({ row, start: 0, end: this.terminal.cols }));
+    const covered = (row: number, column: number): boolean => !restoreAll
+      && [...this.#placed.values()].some((p) => {
+        if (p.bufferType !== buffer.type || !p.transparentCanvas) return false;
+        const bounds = this.#placementBounds(p);
+        return row + buffer.viewportY >= bounds.start && row + buffer.viewportY <= bounds.end
+          && column >= p.transparentCanvas.startCol && column < p.transparentCanvas.endCol;
+      });
+    const parts: string[] = [];
+    for (const range of ranges) {
+      if (range.row < 0 || range.row >= this.terminal.rows) continue;
+      const line = buffer.getLine(buffer.viewportY + range.row);
+      const visible = shown.getLine(shown.viewportY + range.row);
+      for (let col = Math.max(0, range.start); col < Math.min(range.end, this.terminal.cols); col++) {
+        const cell = line?.getCell(col);
+        const actual = visible?.getCell(col);
+        if (!cell || cell.getWidth() === 0 || !cell.getChars()) continue;
+        if (!plan && (!actual?.isInvisible() || cell.isInvisible() || covered(range.row, col))) continue;
+        const rendition = cell as unknown as XtermRendition;
+        if (!isXtermRendition(rendition) || rendition.extended._urlId !== 0) return undefined;
+        const sgr = xtermRenditionSgr(rendition);
+        if (!sgr) return undefined;
+        if (plan && actual?.isInvisible() && actual.getChars() === cell.getChars()) continue;
+        parts.push(cursorPosition(range.row + 1, col + 1), sgr,
+          `\x1b[${rendition.isProtected() ? 1 : 0}\"q`, plan ? "\x1b[8m" : "", cell.getChars());
+      }
+    }
+    return parts.length ? parts.join("") + penSgr
+      + `\x1b[${pen.isProtected() ? 1 : 0}\"q` + cursor : "";
+  }
+
+  async #writeGraphicsTransaction(
+    value: string | (() => string | Uint8Array | undefined)
+  ): Promise<boolean> {
+    let mirrored = "";
+    const create = (): string | Uint8Array | undefined => {
+      const data = typeof value === "function" ? value() : value;
+      if (data === undefined) return undefined;
+      if (data.length === 0) return undefined;
+      mirrored = String(data);
+      // DEC synchronized output is a boolean mode, not a stack. Opening and
+      // closing our own frame inside an Agent-owned frame would close theirs.
+      return (this.#outputFrameActive || (this.#graphicsSynchronizedOutputOverride
+        ?? this.terminal.modes.synchronizedOutputMode))
+        ? data
+        : synchronizedOutput(String(data));
+    };
+    try {
+      if (this.#writeGraphics) {
+        const emitted = await this.#writeGraphics(create);
+        if (emitted) await this.#writePresentation(mirrored);
+        return emitted;
+      }
+      const data = create();
+      if (data === undefined) return false;
+      this.#writeOuter(data);
+      await this.#writePresentation(mirrored);
+      return true;
+    } catch (error) {
+      // Fire-and-forget lifecycle deletes use this same path. Never create an
+      // unhandled rejection; TerminalWriter still retains and reports the
+      // poisoned stdout error during proxy cleanup.
+      this.#debug(`terminal graphics write failed: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
+  get originMode(): boolean {
+    return this.terminal.modes.originMode;
+  }
+
+  get synchronizedOutputMode(): boolean {
+    return this.terminal.modes.synchronizedOutputMode;
+  }
+
+  /** Covers lifecycle deletes during mirror writes as well as the final scan. */
+  setOutputFrameActive(active: boolean): void {
+    this.#outputFrameActive = active;
+  }
+
+  get pendingWrap(): boolean {
+    return this.terminal.buffer.active.cursorX >= this.terminal.cols;
+  }
+
+  #rightMarginGraphemeWidth(fallback: number): number {
+    const buffer = this.terminal.buffer.active;
+    const line = buffer.getLine(buffer.baseY + buffer.cursorY);
+    if (!line) return fallback;
+    for (let column = this.terminal.cols - 1; column >= 0; column -= 1) {
+      const cell = line.getCell(column);
+      if (!cell || cell.getWidth() === 0) continue;
+      return cell.getChars() ? Math.max(1, cell.getWidth()) : fallback;
+    }
+    return fallback;
+  }
+
+  /**
+   * Restore an idle pending-wrap cursor without consuming the application's
+   * one-slot DECSC/DECRC save state.
+   *
+   * CUP can address only the final physical cell, not xterm/Ghostty's hidden
+   * "the next printable wraps" bit. Rewriting the exact right-edge grapheme
+   * recreates that bit while leaving the visible cell unchanged. The replay is
+   * allowed only when the mirror can reproduce every relevant print state.
+   */
+  #pendingWrapReplay(): string | undefined {
+    const buffer = this.terminal.buffer.active;
+    if (buffer.cursorX < this.terminal.cols) return undefined;
+    if (!this.terminal.modes.wraparoundMode
+      || this.terminal.modes.insertMode
+      || !xtermUsesDefaultCharset(this.terminal)) return undefined;
+
+    const line = buffer.getLine(buffer.baseY + buffer.cursorY);
+    if (!line) return undefined;
+    let startColumn = this.terminal.cols - 1;
+    let cell = line.getCell(startColumn);
+    while (startColumn > 0 && cell?.getWidth() === 0) {
+      startColumn -= 1;
+      cell = line.getCell(startColumn);
+    }
+    if (!cell || cell.getWidth() <= 0
+      || startColumn + cell.getWidth() !== this.terminal.cols) return undefined;
+    const grapheme = cell.getChars();
+    // A standalone combining/format character would attach to the preceding
+    // cell when replayed. Kitty's Unicode placeholder must also remain owned
+    // by the application that emitted it.
+    if (!grapheme
+      || /[\x00-\x1f\x7f-\x9f]/u.test(grapheme)
+      || /^[\p{Mark}\u200d\ufe00-\ufe0f]/u.test(grapheme)
+      || grapheme.includes("\u{10eeee}")) return undefined;
+
+    const current = xtermPrivateCore(this.terminal)?._inputHandler?._curAttrData;
+    const cellRendition = cell as unknown as XtermRendition;
+    if (!isXtermRendition(current) || !isXtermRendition(cellRendition)) return undefined;
+    // OSC 8 links have terminal-private identities. Replaying is exact when
+    // the current pen and final cell are in the same link; otherwise wait for
+    // ordinary child output instead of splitting or regrouping that link.
+    if (current.extended._urlId !== cellRendition.extended._urlId) return undefined;
+
+    let enter = "";
+    let leave = "";
+    if (!sameXtermStyle(current, cellRendition)) {
+      const cellSgr = xtermRenditionSgr(cellRendition);
+      const currentSgr = xtermRenditionSgr(current);
+      if (!cellSgr || !currentSgr) return undefined;
+      enter += cellSgr;
+      leave = currentSgr + leave;
+    }
+    const currentProtected = Boolean(current.isProtected());
+    const cellProtected = Boolean(cellRendition.isProtected());
+    if (currentProtected !== cellProtected) {
+      enter += `\x1b[${cellProtected ? 1 : 0}\"q`;
+      leave += `\x1b[${currentProtected ? 1 : 0}\"q`;
+    }
+    return cursorPosition(buffer.cursorY + 1, startColumn + 1)
+      + enter
+      + grapheme
+      + leave;
+  }
+
+  #cursorRestoreAfterGraphics(): string | undefined {
+    const buffer = this.terminal.buffer.active;
+    // A resize can widen the previewed mirror out of pending-wrap while the
+    // real terminal is still one held grapheme behind it. The held delta takes
+    // precedence regardless of the mirror's post-resize cursor state.
+    if (this.#pendingWrapHeldColumns !== undefined) {
+      return cursorPosition(
+        buffer.cursorY + 1,
+        Math.max(1, buffer.cursorX - this.#pendingWrapHeldColumns + 1)
+      );
+    }
+    if (buffer.cursorX >= this.terminal.cols) return this.#pendingWrapReplay();
+    return cursorPosition(buffer.cursorY + 1, buffer.cursorX + 1);
+  }
+
+  /**
+   * Scan while the real terminal is still one ordinary cell behind the mirror.
+   * Every CUP restore targets that pre-cell position; the proxy writes the held
+   * character only after all graphics commands have been queued.
+   */
+  async flushScanBeforeHeldCell(
+    heldColumns = 1,
+    synchronizedOutputModeBeforeHeld?: boolean
+  ): Promise<void> {
+    const previousOverride = this.#graphicsSynchronizedOutputOverride;
+    this.#graphicsSynchronizedOutputOverride = synchronizedOutputModeBeforeHeld;
+    try {
+      if (!this.pendingWrap) {
+        await this.flushScan(true);
+        return;
+      }
+      // A resize probe temporarily suspends placement while the real terminal
+      // is already at its new geometry. Returning here would let the proxy
+      // forward the held right-margin cell. The real terminal would then enter
+      // pending wrap, a state CUP cannot restore, and every later scan would
+      // defer the formula indefinitely. Keep that single cell held until the
+      // newest probe resumes layout, even when resize epochs supersede it.
+      while (!this.#disposed && this.#capabilities.kittyGraphics && !this.originMode) {
+        if (this.#layoutSuspended) {
+          await new Promise<void>((resolve) => this.#layoutWaiters.push(resolve));
+          continue;
+        }
+        // Derive the width from the same xterm grapheme provider that previewed
+        // the held cell. Unicode versions can disagree with `string-width`
+        // (for example U+1FA77), and trusting the caller would restore the real
+        // cursor one column too far left.
+        this.#pendingWrapHeldColumns = this.#rightMarginGraphemeWidth(
+          Math.max(1, Math.floor(heldColumns))
+        );
+        try {
+          await this.flushScan(true);
+        } finally {
+          this.#pendingWrapHeldColumns = undefined;
+        }
+        if (!this.#layoutSuspended) return;
+      }
+    } finally {
+      this.#graphicsSynchronizedOutputOverride = previousOverride;
+    }
+  }
+
+  get recentFormulas(): readonly RecentFormulaEntry[] {
+    return this.#recentFormulas;
+  }
+
+  get formulaFocusActive(): boolean {
+    return this.#focusIndex >= 0;
+  }
+
+  #rememberFormula(
+    plan: FormulaPlacementPlan,
+    update: { fitScale?: number; degradationReason?: string | null } = {}
+  ): RecentFormulaEntry {
+    const identity = JSON.stringify([plan.formula, plan.canvas, plan.mode]);
+    const existingIndex = this.#recentFormulas.findIndex((entry) =>
+      JSON.stringify([entry.plan.formula, entry.plan.canvas, entry.plan.mode]) === identity
+    );
+    const existing = existingIndex >= 0
+      ? this.#recentFormulas.splice(existingIndex, 1)[0]
+      : undefined;
+    const entry: RecentFormulaEntry = {
+      id: existing?.id ?? this.#recentFormulaId++,
+      formula: plan.formula,
+      plan,
+      ...(update.fitScale !== undefined
+        ? { fitScale: update.fitScale }
+        : existing?.fitScale !== undefined ? { fitScale: existing.fitScale } : {}),
+      ...(typeof update.degradationReason === "string"
+        ? { degradationReason: update.degradationReason }
+        : update.degradationReason === null
+          ? {}
+          : existing?.degradationReason !== undefined
+            ? { degradationReason: existing.degradationReason }
+            : {}),
+      observedAt: Date.now()
+    };
+    this.#recentFormulas.unshift(entry);
+    if (this.#recentFormulas.length > this.#recentFormulaLimit) {
+      this.#recentFormulas.length = this.#recentFormulaLimit;
+    }
+    return entry;
+  }
+
+  async focusLatestFormula(): Promise<boolean> {
+    if (this.#recentFormulas.length === 0 || !this.#capabilities.kittyGraphics) return false;
+    const previousIndex = this.#focusIndex;
+    this.#focusIndex = 0;
+    this.#focusDirty = true;
+    const focused = await this.refreshFormulaFocus();
+    if (!focused && !this.#focusPlacement) {
+      this.#focusIndex = previousIndex;
+      this.#focusDirty = false;
+    }
+    return focused;
+  }
+
+  async focusNextFormula(): Promise<boolean> {
+    if (this.#recentFormulas.length === 0) return false;
+    this.#focusIndex = this.#focusIndex < 0
+      ? 0
+      : (this.#focusIndex + 1) % this.#recentFormulas.length;
+    this.#focusDirty = true;
+    return this.refreshFormulaFocus();
+  }
+
+  async focusPreviousFormula(): Promise<boolean> {
+    if (this.#recentFormulas.length === 0) return false;
+    this.#focusIndex = this.#focusIndex < 0
+      ? 0
+      : (this.#focusIndex - 1 + this.#recentFormulas.length) % this.#recentFormulas.length;
+    this.#focusDirty = true;
+    return this.refreshFormulaFocus();
+  }
+
+  async refreshFormulaFocus(): Promise<boolean> {
+    if (this.#focusIndex < 0) return false;
+    if (!this.#focusDirty && this.#focusPlacement) return true;
+    if (this.#disposed || this.#layoutSuspended || !this.#capabilities.kittyGraphics) return false;
+    const entry = this.#recentFormulas[this.#focusIndex];
+    if (!entry) {
+      await this.closeFormulaFocus();
+      return false;
+    }
+    const columns = this.terminal.cols;
+    const rows = this.terminal.rows;
+    const plan: FormulaPlacementPlan = {
+      formula: entry.formula,
+      canvas: { startRow: 0, endRow: rows - 1, startCol: 0, endCol: columns },
+      sourceMasks: [],
+      formulaSlices: [],
+      mode: "source",
+      estimatedQuality: 100,
+      composite: false
+    };
+    try {
+      const rendered = await this.#renderer.renderPlacement(
+        plan,
+        this.#capabilities,
+        this.#scale
+      );
+      const previous = this.#focusPlacement;
+      const restoreCursor = this.#cursorRestoreAfterGraphics();
+      if (!restoreCursor) return false;
+      const imageId = this.#nextImageId();
+      const placementId = this.#nextPlacementId();
+      const emitted = await this.#writeGraphicsTransaction([
+        previous ? kittyDeletePlacement(previous.imageId, previous.placementId) : "",
+        previous ? kittyDeleteImage(previous.imageId) : "",
+        this.#transmitImage(rendered.png, imageId),
+        cursorPosition(1, 1),
+        kittyPlaceImage(
+          imageId,
+          placementId,
+          columns,
+          rows,
+          undefined,
+          TFORMULA_FOCUS_Z_INDEX
+        ),
+        restoreCursor
+      ].join(""));
+      if (!emitted) {
+        this.#allocatedImageIds.delete(imageId);
+        return false;
+      }
+      if (previous) this.#allocatedImageIds.delete(previous.imageId);
+      this.#focusPlacement = { imageId, placementId };
+      this.#focusDirty = false;
+      entry.fitScale = rendered.fitScale;
+      this.#debug(`focused formula ${entry.id} across ${columns}x${rows} cells`);
+      return true;
+    } catch (error) {
+      entry.degradationReason = `focus render failed: ${error instanceof Error ? error.message : String(error)}`;
+      this.#debug(`formula focus skipped: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
+  async closeFormulaFocus(): Promise<void> {
+    this.#focusIndex = -1;
+    this.#focusDirty = false;
+    const placement = this.#focusPlacement;
+    this.#focusPlacement = undefined;
+    if (!placement) return;
+    const restoreCursor = this.#cursorRestoreAfterGraphics() ?? "";
+    await this.#writeGraphicsTransaction(
+      kittyDeletePlacement(placement.imageId, placement.placementId)
+      + kittyDeleteImage(placement.imageId)
+      + restoreCursor
+    );
+    this.#allocatedImageIds.delete(placement.imageId);
+  }
+
+  /** True while at least one terminal-side placement must survive ED 2. */
+  get hasTerminalPlacements(): boolean {
+    return this.#placed.size > 0 || this.#detachedPlacements.size > 0;
+  }
+
+  /**
+   * True only when no formula-bearing screen state could be lost by allowing a
+   * formula-free PTY burst through without intermediate viewport checkpoints.
+   */
+  get canSkipOutputCheckpoints(): boolean {
+    if (this.#disposed
+      || this.#layoutSuspended
+      || this.#pendingWrites !== 0
+      || this.#scanning
+      || this.#rescanRequested
+      || this.#scanTimer !== undefined
+      || this.#placed.size !== 0
+      || this.#detachedPlacements.size !== 0
+      || this.#imageRetries.size !== 0
+      || this.#placementRetries.size !== 0
+      || this.#formulaStability.size !== 0) return false;
+
+    // A stable but incomplete opener such as `x-`, `$`, or `\(` may become a
+    // real formula when the next callback contains only operands. Require the
+    // existing viewport to be trigger-free before extending the plain-output
+    // fast path across callback boundaries.
+    const buffer = this.terminal.buffer.active;
+    for (let row = 0; row < this.terminal.rows; row += 1) {
+      const text = buffer.getLine(buffer.viewportY + row)?.translateToString(true) ?? "";
+      if (containsFormulaTrigger(text)) return false;
+    }
+    return true;
+  }
+
+  #completeWrite(): void {
+    if (this.#pendingWrites > 0) this.#pendingWrites -= 1;
+    if (this.#pendingWrites > 0) return;
+    for (const resolve of this.#writeWaiters.splice(0)) resolve();
+    if (!this.#layoutSuspended) this.scheduleScan();
+  }
+
+  /** Place memory-cached formulas before frame release; never wait for typesetting. */
+  async flushCachedScan(ownFrame = false): Promise<boolean> {
+    if (this.#disposed || this.#scanning || this.#layoutSuspended) return false;
+    const previous = this.#graphicsSynchronizedOutputOverride;
+    if (ownFrame) this.#graphicsSynchronizedOutputOverride = true;
+    this.#cachedScanMiss = false;
+    try {
+      await this.#scan(true, true, true);
+      return !this.#cachedScanMiss;
+    }
+    finally { this.#graphicsSynchronizedOutputOverride = previous; }
+  }
+
+  /** Give an in-flight render or a new layout a bounded chance to join this frame. */
+  async flushFrameScan(ownFrame = false, budgetMs = 40): Promise<void> {
+    if (this.#disposed || this.#layoutSuspended) return;
+    const previous = this.#graphicsSynchronizedOutputOverride;
+    if (ownFrame) this.#graphicsSynchronizedOutputOverride = true;
+    const deadline = performance.now() + budgetMs;
+    const withinBudget = async (work: Promise<unknown>): Promise<boolean> => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          work.then(() => true),
+          new Promise<false>((resolve) => {
+            timer = setTimeout(() => resolve(false), Math.max(0, deadline - performance.now()));
+          })
+        ]);
+      } finally { if (timer) clearTimeout(timer); }
+    };
+    try {
+      while (this.#scanning && performance.now() < deadline) {
+        let done!: () => void;
+        const waiting = new Promise<void>((resolve) => { done = resolve; this.#scanWaiters.push(done); });
+        const finished = await withinBudget(waiting);
+        const index = this.#scanWaiters.indexOf(done);
+        if (index >= 0) this.#scanWaiters.splice(index, 1);
+        if (!finished || this.#disposed || this.#layoutSuspended) return;
+      }
+      if (this.#scanning) return;
+      if (await this.flushCachedScan(ownFrame)) return;
+      if (performance.now() < deadline) await withinBudget(this.#scan(true, true));
+    } finally { this.#graphicsSynchronizedOutputOverride = previous; }
+  }
+
+  async flushScan(allowQueuedWrites = false): Promise<void> {
+    while (!this.#disposed) {
+      if (!allowQueuedWrites && this.#pendingWrites > 0) {
+        await new Promise<void>((resolve) => this.#writeWaiters.push(resolve));
+        continue;
+      }
+      if (this.#layoutSuspended) {
+        // Resize geometry is applied synchronously and capability probes resume
+        // the layout directly from the terminal-input/timeout path. A PTY
+        // checkpoint can therefore wait without depending on outputQueue. If it
+        // returned, an already-buffered Agent response could scroll every
+        // formula in this slice away during the short probe window.
+        if (!allowQueuedWrites) return;
+        await new Promise<void>((resolve) => this.#layoutWaiters.push(resolve));
+        continue;
+      }
+      // These modes deliberately disable placement. Returning here is also
+      // essential: #scan() exits early without consuming rescanRequested, so
+      // looping in flushScan would otherwise starve the event loop forever.
+      if (!this.#capabilities.kittyGraphics || this.terminal.modes.originMode) return;
+      if (this.#scanTimer) {
+        // A retry timer represents a real backoff deadline. A checkpoint must
+        // not fast-forward it repeatedly and exhaust the retry budget in one
+        // synchronous flush.
+        if (this.#scanTimerRetryOnly) return;
+        clearTimeout(this.#scanTimer);
+        this.#scanTimer = undefined;
+        this.#scanTimerDueAt = 0;
+        this.#scanTimerRetryOnly = false;
+      }
+      if (this.#scanning) {
+        await new Promise<void>((resolve) => this.#scanWaiters.push(resolve));
+        // The scan we joined may have started before the checkpoint slice was
+        // mirrored. Run one scan of our own before releasing the queue barrier.
+        if (allowQueuedWrites) continue;
+      } else {
+        await this.#scan(allowQueuedWrites, true);
+        // Later PTY slices are deliberately reserved before they execute so an
+        // unrelated background scan cannot commit stale coordinates. At an
+        // output checkpoint, however, those slices are behind this operation
+        // in outputQueue. Waiting for them here is a dependency cycle; scan the
+        // exact mirror state at the barrier once, then let them proceed.
+        if (allowQueuedWrites) return;
+      }
+      if (!this.#scanning && !this.#scanTimer && !this.#rescanRequested) return;
+    }
+  }
+
+  resize(cols: number, rows: number, epoch?: number, deferUntilCapabilities = false): void {
+    if (this.#focusIndex >= 0) this.#focusDirty = true;
+    // A terminal may rebuild its cell grid (notably during rapid font zoom)
+    // without reporting whether Kitty placements survived. Treat every resize
+    // callback as a new placement generation. Rendered PNGs remain cached, but
+    // visible cell pins are reasserted once and a formula blocked by a stale
+    // transient snapshot receives a fresh attempt at the new geometry.
+    this.#resizeGeneration += 1;
+    this.#blockedPlacementKeys.clear();
+    this.#placementRetries.clear();
+    this.#formulaStability.clear();
+    // Reflow may dispose both xterm markers before the replacement scan can
+    // match the old placement. Snapshot only currently visible placements;
+    // off-screen scrollback pins must remain untouched by layout work.
+    for (const placement of this.#placed.values()) {
+      if (!this.#placementIsVisible(placement)) continue;
+      const bounds = this.#placementBounds(placement);
+      if (bounds.start >= 0 && bounds.end >= 0) {
+        placement.layoutHint = bounds;
+        placement.layoutHintTrimGeneration = placement.bufferType === "normal"
+          ? this.#normalTrimGeneration
+          : undefined;
+      }
+    }
+    // Unlike the normal buffer, alternate-screen rows cannot be followed by
+    // markers through a terminal resize. Treat their coordinates as stale.
+    this.#markAlternateLayoutDirty(true);
+    const nextCols = Math.max(2, cols);
+    const nextRows = Math.max(2, rows);
+    const cursorLineReflow = nextCols === this.terminal.cols
+      ? undefined
+      : this.#captureCursorLineReflow();
+    this.#resizing = true;
+    try {
+      this.terminal.resize(nextCols, nextRows);
+      if (cursorLineReflow) this.#restoreCursorLineReflow(cursorLineReflow);
+      this.#presentation?.resize(nextCols, nextRows);
+      if (this.#presentation) {
+        const target = mutableXtermBufferCursor(this.#presentation);
+        const source = mutableXtermBufferCursor(this.terminal);
+        if (target && source) { target.x = source.x; target.y = source.y; }
+      }
+    } finally {
+      cursorLineReflow?.startMarker?.dispose();
+      this.#resizing = false;
+    }
+    for (const placement of this.#placed.values()) {
+      if (!placement.layoutHint) continue;
+      const hasLiveMarker = [placement.startMarker, placement.endMarker].some((marker) =>
+        Boolean(marker && !marker.isDisposed && marker.line >= 0)
+      );
+      // The hint is only needed when this synchronous reflow destroyed both
+      // markers. If either survived, it is authoritative and clearing the hint
+      // prevents a much later scrollback trim from reusing stale coordinates.
+      if (hasLiveMarker) {
+        placement.layoutHint = undefined;
+        placement.layoutHintTrimGeneration = undefined;
+      }
+    }
+    // Kitty placements are cell-based and resize with the terminal. Keep them
+    // until the next scan selectively replaces formulas still in the live
+    // viewport; off-screen scrollback cannot be reconstructed later.
+    this.#layoutVersion += 1;
+    if (epoch === undefined || epoch === this.#layoutEpoch) {
+      this.#layoutSuspended = deferUntilCapabilities;
+    }
+    if (!this.#layoutSuspended) {
+      for (const resolve of this.#layoutWaiters.splice(0)) resolve();
+    }
+    if (!this.#layoutSuspended) this.scheduleScan(16);
+  }
+
+  #captureCursorLineReflow(): CursorLineReflowSnapshot | undefined {
+    const buffer = this.terminal.buffer.active;
+    const cursorAbsoluteRow = buffer.baseY + buffer.cursorY;
+    const cursorLine = buffer.getLine(cursorAbsoluteRow);
+    // The xterm bug is specific to a current line that already continues a
+    // wrapped logical line. Avoid touching ordinary TUI cursor positioning.
+    if (!cursorLine?.isWrapped) return undefined;
+
+    let startAbsoluteRow = cursorAbsoluteRow;
+    while (startAbsoluteRow > 0
+      && buffer.getLine(startAbsoluteRow)?.isWrapped) startAbsoluteRow -= 1;
+
+    let endAbsoluteRow = cursorAbsoluteRow;
+    while (endAbsoluteRow + 1 < buffer.length
+      && buffer.getLine(endAbsoluteRow + 1)?.isWrapped) endAbsoluteRow += 1;
+    if (endAbsoluteRow !== cursorAbsoluteRow) return undefined;
+
+    const trimmedColumns = lineTrimmedColumns(cursorLine);
+    const cursorAtContentEnd = buffer.cursorX === trimmedColumns
+      || (buffer.cursorX >= this.terminal.cols
+        && trimmedColumns === this.terminal.cols);
+    if (!cursorAtContentEnd) return undefined;
+
+    // xterm does not support markers in the alternate buffer. There its own
+    // post-reflow y remains correct and #restoreCursorLineReflow walks from
+    // that row. Normal-buffer markers survive row insertion/removal and also
+    // account for scrollback movement during resize.
+    const startMarker = buffer.type === "normal"
+      ? this.terminal.registerMarker(startAbsoluteRow - cursorAbsoluteRow) as IMarker | undefined
+      : undefined;
+    return { bufferType: buffer.type, startMarker };
+  }
+
+  #restoreCursorLineReflow(snapshot: CursorLineReflowSnapshot): void {
+    const buffer = this.terminal.buffer.active;
+    if (buffer.type !== snapshot.bufferType) return;
+    const mutableCursor = mutableXtermBufferCursor(this.terminal);
+    if (!mutableCursor) return;
+
+    let startAbsoluteRow: number;
+    if (snapshot.startMarker) {
+      if (snapshot.startMarker.isDisposed || snapshot.startMarker.line < 0) return;
+      startAbsoluteRow = snapshot.startMarker.line;
+    } else {
+      // Alternate buffers cannot create markers. xterm 6.0 keeps y on the
+      // reflowed logical line even when x is stale, so recover its start.
+      startAbsoluteRow = mutableCursor.ybase + mutableCursor.y;
+      while (startAbsoluteRow > 0
+        && buffer.getLine(startAbsoluteRow)?.isWrapped) startAbsoluteRow -= 1;
+    }
+
+    let endAbsoluteRow = startAbsoluteRow;
+    while (endAbsoluteRow + 1 < buffer.length
+      && buffer.getLine(endAbsoluteRow + 1)?.isWrapped) endAbsoluteRow += 1;
+    const endLine = buffer.getLine(endAbsoluteRow);
+    if (!endLine) return;
+    const targetY = endAbsoluteRow - mutableCursor.ybase;
+    const targetX = lineTrimmedColumns(endLine);
+    if (!Number.isInteger(targetX)
+      || !Number.isInteger(targetY)
+      || targetX < 0
+      || targetX > this.terminal.cols
+      || targetY < 0
+      || targetY >= this.terminal.rows) return;
+
+    // In xterm 6.0.0 reflowCursorLine moves/merges the cells correctly, but
+    // leaves x at its old physical-row value. The next PTY fragment therefore
+    // overwrites earlier LaTeX. Set x/y to the actual reflowed content end;
+    // x===cols intentionally restores pending-wrap at an exact boundary.
+    mutableCursor.x = targetX;
+    mutableCursor.y = targetY;
+  }
+
+  /** Cancel work prepared for the old real-terminal geometry immediately. */
+  invalidateLayout(): number {
+    this.#layoutEpoch += 1;
+    this.#layoutSuspended = true;
+    this.#layoutVersion += 1;
+    this.#scanVersion += 1;
+    this.#rescanRequested = true;
+    this.#formulaStability.clear();
+    if (this.#scanTimer) clearTimeout(this.#scanTimer);
+    this.#scanTimer = undefined;
+    this.#scanTimerDueAt = 0;
+    this.#scanTimerRetryOnly = false;
+    return this.#layoutEpoch;
+  }
+
+  updateCapabilities(capabilities: TerminalCapabilities, resumeEpoch?: number): void {
+    if (this.#focusIndex >= 0) this.#focusDirty = true;
+    const graphicsChanged = capabilities.kittyGraphics !== this.#capabilities.kittyGraphics;
+    const dimensionsChanged = capabilities.cell.width !== this.#capabilities.cell.width
+      || capabilities.cell.height !== this.#capabilities.cell.height;
+    const colorsChanged = capabilities.foreground !== this.#capabilities.foreground
+      || capabilities.background !== this.#capabilities.background;
+    this.#capabilities = capabilities;
+    if (graphicsChanged && capabilities.kittyGraphics && !this.#presentation) {
+      this.#writeGraphicsTransaction(kittyDeleteByZIndex());
+    }
+    if (resumeEpoch !== undefined && resumeEpoch === this.#layoutEpoch) {
+      this.#layoutSuspended = false;
+    }
+    if (!this.#layoutSuspended) {
+      for (const resolve of this.#layoutWaiters.splice(0)) resolve();
+    }
+    if (graphicsChanged || dimensionsChanged || colorsChanged) {
+      this.#layoutVersion += 1;
+    }
+    if (!this.#layoutSuspended
+      && (graphicsChanged || dimensionsChanged || colorsChanged || resumeEpoch !== undefined)) {
+      this.scheduleScan(16);
+    }
+  }
+
+  setScale(scale: number): void {
+    if (this.#focusIndex >= 0) this.#focusDirty = true;
+    this.#scale = scale;
+    this.#layoutVersion += 1;
+    this.scheduleScan();
+  }
+
+  scheduleScan(delayMs = 110, retryOnly = false): void {
+    if (this.#disposed) return;
+    if (!retryOnly) this.#scanVersion += 1;
+    const delay = Math.max(0, delayMs);
+    const dueAt = Date.now() + delay;
+    // Coalesce bursts without postponing forever. Agent status bars and
+    // spinners can write more frequently than the scan delay. If ordinary
+    // work arrives while a retry is sleeping, retain the earlier deadline but
+    // mark it flushable; conversely, never let a later retry delay new output.
+    if (this.#scanTimer) {
+      this.#scanTimerRetryOnly = this.#scanTimerRetryOnly && retryOnly;
+      if (this.#scanTimerDueAt <= dueAt) return;
+      clearTimeout(this.#scanTimer);
+    }
+    this.#scanTimerDueAt = dueAt;
+    this.#scanTimerRetryOnly = retryOnly;
+    this.#scanTimer = setTimeout(() => {
+      this.#scanTimer = undefined;
+      this.#scanTimerDueAt = 0;
+      this.#scanTimerRetryOnly = false;
+      void this.#scan();
+    }, delay);
+  }
+
+  resetPlacements(): void {
+    this.#layoutVersion += 1;
+    this.#formulaStability.clear();
+    if (this.#capabilities.kittyGraphics) {
+      const imageIds = new Set(Array.from(this.#terminalImages.values(), (image) => image.imageId));
+      const commands = [
+        this.#presentation ? (this.#sourceVisibility(undefined, true) ?? "") : "",
+        ...Array.from(imageIds, (imageId) => kittyDeleteImage(imageId)),
+        // The dedicated z-index catches placements from interrupted scans and
+        // previous crashed sessions. Avoid d=R: Ghostty 1.3.1 implements its
+        // range predicate incorrectly and can delete unrelated applications'
+        // Kitty images.
+        kittyDeleteByZIndex()
+      ];
+      this.#writeGraphicsTransaction(commands.join(""));
+    }
+    for (const placement of this.#placed.values()) this.#releasePlacement(placement);
+    for (const placement of this.#detachedPlacements.values()) {
+      this.#releasePlacement(placement);
+    }
+    this.#placed.clear();
+    this.#detachedPlacements.clear();
+    this.#terminalImages.clear();
+    this.#relayoutPendingImageKeys.clear();
+    this.#blockedImageKeys.clear();
+    this.#imageRetries.clear();
+    this.#blockedPlacementKeys.clear();
+    this.#placementRetries.clear();
+    this.#alternateDirtyRows = undefined;
+    this.#alternate47Restored = false;
+  }
+
+  /**
+   * Forget a terminal-side image rejected or evicted by Kitty graphics.
+   * MathRenderer's content cache remains intact; the next scan only reuploads
+   * the already-rendered PNG and creates a fresh placement.
+   */
+  ownsTerminalImage(imageId: number): boolean {
+    return this.#allocatedImageIds.has(imageId);
+  }
+
+  /** Confirm that the terminal, rather than only stdout, accepted an upload. */
+  markTerminalImageAccepted(imageId: number): boolean {
+    const keys = Array.from(this.#terminalImages.entries())
+      .filter(([, image]) => image.imageId === imageId)
+      .map(([key]) => key);
+    for (const key of keys) {
+      this.#imageRetries.delete(key);
+      this.#blockedImageKeys.delete(key);
+    }
+    return keys.length > 0;
+  }
+
+  /** Confirm one placement before forgetting its consecutive-error history. */
+  markTerminalPlacementAccepted(imageId: number, placementId: number): boolean {
+    const placement = Array.from(this.#placed.values()).find((candidate) =>
+      candidate.imageId === imageId && candidate.placementId === placementId
+    ) ?? this.#findDetachedPlacement(imageId, placementId);
+    if (!placement) return false;
+    const key = `${placement.anchor}|${placement.fingerprint}`;
+    this.#placementRetries.delete(key);
+    this.#blockedPlacementKeys.delete(key);
+    return true;
+  }
+
+  #detachedPlacementKey(placement: PlacedFormula): string {
+    return `${placement.imageId}:${placement.placementId}`;
+  }
+
+  #findDetachedPlacement(imageId: number, placementId: number): PlacedFormula | undefined {
+    const placement = this.#detachedPlacements.get(`${imageId}:${placementId}`);
+    return placement?.imageId === imageId && placement.placementId === placementId
+      ? placement
+      : undefined;
+  }
+
+  #detachPlacement(anchor: string, placement: PlacedFormula): void {
+    this.#placed.delete(anchor);
+    placement.layoutHint = undefined;
+    placement.layoutHintTrimGeneration = undefined;
+    this.#placementRetries.delete(`${anchor}|${placement.fingerprint}`);
+    this.#blockedPlacementKeys.delete(`${anchor}|${placement.fingerprint}`);
+    this.#detachedPlacements.set(this.#detachedPlacementKey(placement), placement);
+    this.#pruneDetachedPlacements(this.#maxDetachedPlacements, false, true);
+  }
+
+  #deleteDetachedPlacement(placement: PlacedFormula): void {
+    this.#detachedPlacements.delete(this.#detachedPlacementKey(placement));
+    this.#releasePlacement(placement);
+  }
+
+  invalidateTerminalImage(
+    imageId: number,
+    reason = "terminal graphics error",
+    retry = true
+  ): boolean {
+    const resourcePressure = /\b(?:ENOSPC|ENOMEM)\b/iu.test(reason);
+    const shouldRetry = retry || resourcePressure;
+    const affected = Array.from(this.#placed.entries())
+      .filter(([, placement]) => placement.imageId === imageId);
+    const detachedAffected = Array.from(this.#detachedPlacements.values())
+      .filter((placement) => placement.imageId === imageId);
+    const imageKeys = Array.from(this.#terminalImages.entries())
+      .filter(([, image]) => image.imageId === imageId)
+      .map(([key]) => key);
+    if (affected.length === 0 && detachedAffected.length === 0 && imageKeys.length === 0) {
+      return false;
+    }
+
+    if (this.#capabilities.kittyGraphics) this.#writeOuter(kittyDeleteImage(imageId));
+
+    for (const [anchor, placement] of affected) {
+      this.#releasePlacement(placement);
+      this.#placed.delete(anchor);
+    }
+    for (const placement of detachedAffected) this.#deleteDetachedPlacement(placement);
+    for (const key of imageKeys) this.#terminalImages.delete(key);
+    // A terminal quota error can be transient. The oldest markerless pin is
+    // the least useful terminal allocation we still own, so release one before
+    // deleting idle uploads. Repeated bounded retries progressively free more
+    // historical pins instead of sacrificing a currently visible formula.
+    if (resourcePressure) {
+      const released = this.#pruneDetachedPlacements(
+        Math.max(0, this.#detachedPlacements.size - 1),
+        true
+      );
+      if (released === 0) this.#evictIdleTerminalImages(true);
+    }
+    let retryDelay = 0;
+    let willRetry = false;
+    for (const key of imageKeys) {
+      if (!shouldRetry) {
+        this.#blockedImageKeys.add(key);
+        continue;
+      }
+      const attempt = (this.#imageRetries.get(key)?.attempt ?? 0) + 1;
+      if (attempt > 5) {
+        this.#blockedImageKeys.add(key);
+        this.#imageRetries.delete(key);
+        this.#debug(`terminal image ${imageId} exceeded the graphics retry limit`);
+        continue;
+      }
+      retryDelay = Math.max(retryDelay, Math.min(2_000, 50 * (2 ** (attempt - 1))));
+      this.#imageRetries.set(key, { attempt, notBefore: Date.now() + retryDelay });
+      willRetry = true;
+    }
+    this.#layoutVersion += 1;
+    this.#debug(`${reason}; invalidated terminal image ${imageId}`);
+    if (this.#presentation) void this.#writeGraphicsTransaction(() => this.#sourceVisibility());
+    if (willRetry) this.scheduleScan(retryDelay || 50, true);
+    else if (this.#presentation) this.scheduleScan(0, true);
+    return true;
+  }
+
+  /** Retry one rejected placement without invalidating its shared image. */
+  invalidateTerminalPlacement(
+    imageId: number,
+    placementId: number,
+    reason = "terminal graphics placement error",
+    retry = true
+  ): boolean {
+    const affected = Array.from(this.#placed.entries()).find(([, placement]) =>
+      placement.imageId === imageId && placement.placementId === placementId
+    );
+    if (!affected) {
+      const detached = this.#findDetachedPlacement(imageId, placementId);
+      if (!detached) return false;
+      if (this.#capabilities.kittyGraphics) {
+        this.#writeOuter(kittyDeletePlacement(imageId, placementId));
+      }
+      // Once the mirror has lost both markers there is no safe CUP coordinate
+      // at which to retry this one placement. Keep the shared rendered/image
+      // caches, but stop tracking the rejected pin.
+      this.#deleteDetachedPlacement(detached);
+      this.#layoutVersion += 1;
+      this.#debug(`${reason}; dropped detached terminal placement ${placementId}`);
+      this.#evictIdleTerminalImages();
+      return true;
+    }
+    const [anchor, placement] = affected;
+    if (this.#capabilities.kittyGraphics) {
+      this.#writeOuter(kittyDeletePlacement(imageId, placementId));
+    }
+    this.#releasePlacement(placement, true);
+    this.#placed.delete(anchor);
+
+    const key = `${anchor}|${placement.fingerprint}`;
+    let retryDelay = 0;
+    if (!retry) {
+      this.#blockedPlacementKeys.add(key);
+    } else {
+      const attempt = (this.#placementRetries.get(key)?.attempt ?? 0) + 1;
+      if (attempt > 5) {
+        this.#blockedPlacementKeys.add(key);
+        this.#placementRetries.delete(key);
+        this.#debug(`terminal placement ${placementId} exceeded the graphics retry limit`);
+      } else {
+        retryDelay = Math.min(2_000, 50 * (2 ** (attempt - 1)));
+        this.#placementRetries.set(key, {
+          attempt,
+          notBefore: Date.now() + retryDelay
+        });
+      }
+    }
+    this.#layoutVersion += 1;
+    this.#debug(`${reason}; invalidated terminal placement ${placementId}`);
+    if (this.#presentation) void this.#writeGraphicsTransaction(() => this.#sourceVisibility());
+    this.#evictIdleTerminalImages();
+    if (retryDelay > 0) this.scheduleScan(retryDelay, true);
+    else if (this.#presentation) this.scheduleScan(0, true);
+    return true;
+  }
+
+  #forgetAllPlacements(): void {
+    this.#layoutVersion += 1;
+    this.#formulaStability.clear();
+    for (const placement of this.#placed.values()) this.#releasePlacement(placement);
+    for (const placement of this.#detachedPlacements.values()) {
+      this.#releasePlacement(placement);
+    }
+    this.#placed.clear();
+    this.#detachedPlacements.clear();
+    this.#terminalImages.clear();
+    this.#relayoutPendingImageKeys.clear();
+    this.#blockedImageKeys.clear();
+    this.#imageRetries.clear();
+    this.#blockedPlacementKeys.clear();
+    this.#placementRetries.clear();
+    this.#alternateDirtyRows = undefined;
+    this.#alternate47Restored = false;
+  }
+
+  #forgetBufferState(bufferType: string): void {
+    this.#layoutVersion += 1;
+    for (const [anchor, placement] of this.#placed) {
+      if (placement.bufferType !== bufferType) continue;
+      this.#releasePlacement(placement);
+      this.#placed.delete(anchor);
+    }
+    for (const placement of Array.from(this.#detachedPlacements.values())) {
+      if (placement.bufferType !== bufferType) continue;
+      this.#deleteDetachedPlacement(placement);
+    }
+    const prefix = `${bufferType}:`;
+    for (const key of this.#terminalImages.keys()) {
+      if (key.startsWith(prefix)) this.#terminalImages.delete(key);
+    }
+    for (const key of this.#relayoutPendingImageKeys) {
+      if (key.startsWith(prefix)) this.#relayoutPendingImageKeys.delete(key);
+    }
+    for (const key of this.#imageRetries.keys()) {
+      if (key.startsWith(prefix)) this.#imageRetries.delete(key);
+    }
+    for (const key of this.#blockedImageKeys) {
+      if (key.startsWith(prefix)) this.#blockedImageKeys.delete(key);
+    }
+    for (const key of this.#placementRetries.keys()) {
+      if (key.startsWith(prefix)) this.#placementRetries.delete(key);
+    }
+    for (const key of this.#blockedPlacementKeys) {
+      if (key.startsWith(prefix)) this.#blockedPlacementKeys.delete(key);
+    }
+    for (const key of this.#formulaStability.keys()) {
+      if (key.startsWith(prefix)) this.#formulaStability.delete(key);
+    }
+    if (bufferType === "alternate") {
+      this.#alternateDirtyRows = undefined;
+      this.#alternate47Restored = false;
+    }
+  }
+
+  /** Viewport rows a scroll can move, or undefined when they are unknowable. */
+  #scrollRegionRows(): { start: number; end: number } | undefined {
+    const margins = xtermScrollMargins(this.terminal);
+    if (!margins) return undefined;
+    return { start: margins.top, end: Math.min(margins.bottom, this.terminal.rows - 1) };
+  }
+
+  /**
+   * @param rows Viewport rows the operation may have moved. Undefined means
+   * "unknown", which is treated as the whole screen so an unrecognised xterm
+   * internal shape degrades to the conservative all-placements invalidation.
+   */
+  #markAlternateLayoutDirty(force = false, rows?: { start: number; end: number }): void {
+    if ((!force && this.terminal.buffer.active.type !== "alternate")
+      || !Array.from(this.#placed.values()).some((placement) =>
+        placement.bufferType === "alternate"
+      )) return;
+    const dirty = rows ?? { start: 0, end: this.terminal.rows - 1 };
+    const previous = this.#alternateDirtyRows;
+    // Several scrolls can land between two scans, so accumulate their union
+    // rather than letting the last one narrow what an earlier one dirtied.
+    this.#alternateDirtyRows = previous
+      ? {
+        start: Math.min(previous.start, dirty.start),
+        end: Math.max(previous.end, dirty.end)
+      }
+      : dirty;
+    this.#layoutVersion += 1;
+    this.#scanVersion += 1;
+    this.#rescanRequested = true;
+  }
+
+  #invalidateDirtyAlternatePlacements(): void {
+    const dirty = this.#alternateDirtyRows;
+    const commands: string[] = [];
+    for (const [anchor, placement] of this.#placed) {
+      if (placement.bufferType !== "alternate") continue;
+      // A scroll moves the Ghostty pin with the cells it covers, so only pins
+      // overlapping the scrolled band lost their coordinates. Pins outside it
+      // are still exactly where they were; deleting them would make an Ink-style
+      // TUI re-place (and, once its image is evicted, re-upload) every formula
+      // on screen each time it redraws an unrelated pane.
+      if (dirty
+        && (placement.absoluteEndRow < dirty.start
+          || placement.absoluteStartRow > dirty.end)) continue;
+      commands.push(kittyDeletePlacement(placement.imageId, placement.placementId));
+      this.#releasePlacement(placement);
+      this.#relayoutPendingImageKeys.add(placement.imageKey);
+      this.#placed.delete(anchor);
+    }
+    // Retry and block state is keyed by anchor, so it obeys the same band. A
+    // formula that keeps failing outside the scrolled rows had its attempt
+    // counter reset by every frame of an animating TUI and therefore never
+    // reached the ceiling that turns a hopeless render into a block: one of the
+    // two mechanisms behind the unbounded retry loop of issue #4.
+    for (const key of this.#placementRetries.keys()) {
+      if (this.#alternateKeyWasMoved(key, dirty)) this.#placementRetries.delete(key);
+    }
+    for (const key of this.#blockedPlacementKeys) {
+      if (this.#alternateKeyWasMoved(key, dirty)) this.#blockedPlacementKeys.delete(key);
+    }
+    this.#alternateDirtyRows = undefined;
+    this.#layoutVersion += 1;
+    if (commands.length > 0) this.#writeGraphicsTransaction(commands.join(""));
+    // Deliberately no eviction here. The placements just released belong to
+    // images the very next scan re-places at their new rows, and for that one
+    // instant every on-screen alternate image looks idle. Evicting now is what
+    // forced a full PNG re-upload of visible formulas once #terminalImages
+    // reached its cap — the scan's own eviction runs after they are re-placed.
+  }
+
+  #forgetVisiblePlacementsRetainingImages(): void {
+    this.#layoutVersion += 1;
+    const commands: string[] = [];
+    for (const [anchor, placement] of this.#placed) {
+      // A clear must remove every placement intersecting the viewport. Keeping
+      // a partially visible placement would leave its visible rows floating
+      // over the newly cleared text. Fully off-screen pins remain intact.
+      if (!this.#placementIsVisible(placement)) continue;
+      commands.push(kittyDeletePlacement(placement.imageId, placement.placementId));
+      this.#releasePlacement(placement);
+      this.#placed.delete(anchor);
+    }
+    if (commands.length > 0) this.#writeGraphicsTransaction(commands.join(""));
+    this.#evictIdleTerminalImages();
+  }
+
+  #applyImageLifecycleControls(data: string, initialBufferType: string): void {
+    let bufferType = initialBufferType;
+    const controls = /\x1bc|(?:\x1b\[|\u009b)\?([0-9;]+)([hl])|(?:\x1b\[|\u009b)([0-9;]*)J/gu;
+    for (const match of data.matchAll(controls)) {
+      const sequence = match[0];
+      if (sequence === "\x1bc") {
+        // RIS resets terminal graphics state, not just the active viewport.
+        this.#forgetAllPlacements();
+        this.#debug("terminal reset forgot all formula images");
+        bufferType = "normal";
+        continue;
+      }
+
+      if (match[1] !== undefined && match[2] !== undefined) {
+        const modes = match[1].split(";");
+        const enabled = match[2] === "h";
+        if (enabled && modes.includes("6")) {
+          // CUP coordinates are relative to the scrolling margins in DECOM.
+          // Remove visible overlays without moving the cursor; once DECOM is
+          // disabled, the ordinary scan can place them again safely.
+          this.#forgetVisiblePlacementsRetainingImages();
+          this.#debug("origin mode deferred formula placement");
+        }
+        const alternateMode = modes.includes("1049")
+          ? "1049"
+          : modes.includes("1047")
+            ? "1047"
+            : modes.includes("47")
+              ? "47"
+              : undefined;
+        if (!alternateMode) continue;
+        if (alternateMode === "47"
+          && enabled
+          && Array.from(this.#placed.values()).some((placement) =>
+            placement.bufferType === "alternate"
+          )) {
+          // Ghostty preserves mode-47 alternate text and Kitty storage, while
+          // xterm-headless starts with an empty mirror on re-entry. Until a
+          // real clear realigns them, never delete retained pins merely because
+          // they are absent from that empty mirror.
+          this.#alternate47Restored = true;
+        }
+        // DECSET 1049 clears the alternate screen on entry; DECSET 1047
+        // clears it on exit. Ghostty stores Kitty images per screen.
+        if ((alternateMode === "1049" && enabled)
+          || (alternateMode === "1047" && !enabled)) {
+          this.#forgetBufferState("alternate");
+          this.#debug("alternate-screen clear forgot alternate formula images");
+        }
+        bufferType = enabled ? "alternate" : "normal";
+        continue;
+      }
+
+      const eraseMode = Number((match[3] ?? "0").split(";")[0] || "0");
+      if (eraseMode !== 2 && eraseMode !== 3) continue;
+      // Ghostty's ED 2 and ED 3 implementation deletes all Kitty image data
+      // for the active screen. Keeping image IDs here creates zombie cache
+      // entries whose later a=p commands fail with ENOENT.
+      this.#forgetBufferState(bufferType);
+      this.#debug(`terminal clear forgot ${bufferType} formula images`);
+    }
+  }
+
+  #placementIsVisible(placement: PlacedFormula): boolean {
+    const buffer = this.terminal.buffer.active;
+    const viewportStart = buffer.viewportY;
+    const viewportEnd = viewportStart + this.terminal.rows - 1;
+    const { start, end } = this.#placementBounds(placement);
+    return placement.bufferType === buffer.type
+      && start >= 0
+      && end >= viewportStart
+      && start <= viewportEnd;
+  }
+
+  #placementBounds(placement: PlacedFormula): { start: number; end: number } {
+    const markerLine = (marker: IMarker | undefined): number | undefined =>
+      marker && !marker.isDisposed && marker.line >= 0 ? marker.line : undefined;
+    const startMarker = markerLine(placement.startMarker);
+    const endMarker = markerLine(placement.endMarker);
+    if (startMarker !== undefined && endMarker !== undefined) {
+      return { start: startMarker, end: endMarker };
+    }
+
+    // xterm reflow can dispose only the marker on a wrapped continuation row.
+    // Infer that missing edge from the last committed row span so the next
+    // layout scan can still pair and transactionally replace the old image.
+    const span = Math.max(0, placement.absoluteEndRow - placement.absoluteStartRow);
+    if (startMarker !== undefined) return { start: startMarker, end: startMarker + span };
+    if (endMarker !== undefined) return { start: Math.max(0, endMarker - span), end: endMarker };
+    if (placement.layoutHint) return placement.layoutHint;
+
+    // Alternate-screen placements have no xterm markers and use fixed rows.
+    // Marker-backed placements whose two markers are gone have left xterm's
+    // retained scrollback and must not masquerade as live absolute rows.
+    if (placement.startMarker || placement.endMarker) return { start: -1, end: -1 };
+    return { start: placement.absoluteStartRow, end: placement.absoluteEndRow };
+  }
+
+  #detachExpiredMarkerPlacements(): void {
+    let detached = 0;
+    for (const [anchor, placement] of Array.from(this.#placed.entries())) {
+      if (!placement.startMarker && !placement.endMarker) continue;
+      const hasLiveMarker = [placement.startMarker, placement.endMarker].some((marker) =>
+        Boolean(marker && !marker.isDisposed && marker.line >= 0)
+      );
+      if (hasLiveMarker) continue;
+      // A visible placement receives this hint immediately before resize. If
+      // that same reflow destroys both markers, keep it coordinate-indexed for
+      // the imminent scan so the replacement and old-pin deletion are emitted
+      // atomically. Off-screen/trimmed placements have no such hint and detach.
+      if (placement.layoutHint
+        && placement.layoutHintTrimGeneration === this.#normalTrimGeneration) continue;
+
+      // xterm disposes markers on soft-wrapped continuation rows when a wider
+      // resize merges those rows.  It also trims at our 10k-line mirror limit,
+      // which can be earlier than Ghostty's byte-based scrollback limit.  In
+      // both cases Ghostty still owns and reflows the off-screen Kitty pin. A
+      // delete here makes the formula raw when the user scrolls back locally,
+      // and that local scroll is invisible to the PTY proxy.  Keep the pin and
+      // rendered-image reference until an explicit terminal clear/reset forgets
+      // it, an image error proves it was evicted, or process teardown clears our
+      // z-index. Move it out of the coordinate-indexed collection entirely:
+      // xterm recycles absolute row/anchor values at its scrollback cap, while
+      // Ghostty's older pin still belongs to a different historical row.
+      this.#detachPlacement(anchor, placement);
+      detached += 1;
+    }
+    if (detached > 0) {
+      this.#debug(`retained ${detached} markerless scrollback formula placement(s)`);
+    }
+  }
+
+  #placementIsPartiallyVisible(placement: PlacedFormula): boolean {
+    const buffer = this.terminal.buffer.active;
+    if (placement.bufferType !== buffer.type) return false;
+    const { start, end } = this.#placementBounds(placement);
+    if (start < 0 || end < 0) return false;
+    const viewportStart = buffer.viewportY;
+    const viewportEnd = viewportStart + this.terminal.rows - 1;
+    return (start < viewportStart && end >= viewportStart)
+      || (start <= viewportEnd && end > viewportEnd);
+  }
+
+  #partialPlacementSourceStillVisible(placement: PlacedFormula): boolean {
+    if (!this.#placementIsPartiallyVisible(placement)) return false;
+    const buffer = this.terminal.buffer.active;
+    const { start, end } = this.#placementBounds(placement);
+    const viewportStart = buffer.viewportY;
+    const viewportEnd = viewportStart + this.terminal.rows - 1;
+    const first = Math.max(start, viewportStart);
+    const last = Math.min(end, viewportEnd);
+    const normalize = (value: string): string => value.replace(/\s+/gu, "");
+    const source = normalize(placement.sourceText);
+    for (let row = first; row <= last; row += 1) {
+      const visible = normalize(buffer.getLine(row)?.translateToString(true) ?? "");
+      if (visible && source.includes(visible)) return true;
+    }
+    return false;
+  }
+
+  #releasePlacement(placement: PlacedFormula, preservePlacementRetry = false): void {
+    const image = this.#terminalImages.get(placement.imageKey);
+    if (image) {
+      image.placements = Math.max(0, image.placements - 1);
+      image.lastUsed = ++this.#imageUse;
+    }
+    if (!preservePlacementRetry) {
+      const retryKey = `${placement.anchor}|${placement.fingerprint}`;
+      this.#placementRetries.delete(retryKey);
+      this.#blockedPlacementKeys.delete(retryKey);
+    }
+    placement.startMarker?.dispose();
+    if (placement.endMarker !== placement.startMarker) placement.endMarker?.dispose();
+  }
+
+  /**
+   * Terminal images the budget can meaningfully be measured against.
+   *
+   * A relayout reservation says an image's fate is undecided until the running
+   * scan reconciles: it is either re-placed, and then a legitimate occupant, or
+   * gone, and then evicted on the spot. Counting it in the meantime makes the
+   * budget unreachable rather than merely exceeded, and #pruneDetachedPlacements
+   * answers an unreachable budget by shedding historical Ghostty pins in its
+   * while loop until it runs out of them — irreversibly, for a number that no
+   * eviction it is permitted to make can move. Deferring the count instead
+   * costs a few milliseconds over the cap.
+   */
+  #budgetedTerminalImages(): number {
+    let reservedIdle = 0;
+    for (const key of this.#relayoutPendingImageKeys) {
+      // A forced eviction ignores the reservation, so a reserved key can outlive
+      // its image; and an image re-placed by the running scan is already decided.
+      if (this.#terminalImages.get(key)?.placements === 0) reservedIdle += 1;
+    }
+    return this.#terminalImages.size - reservedIdle;
+  }
+
+  #takeIdleTerminalImageEvictions(force = false): string[] {
+    const excess = force
+      ? this.#terminalImages.size
+      : this.#budgetedTerminalImages() - this.#maxTerminalImages;
+    if (excess <= 0) return [];
+    const idle = Array.from(this.#terminalImages.entries())
+      .filter(([key, image]) => image.placements === 0
+        // A relayout drops the pins of images that are still covering the
+        // screen and that the running scan re-places within milliseconds.
+        // They are unreferenced, not idle; evicting them costs a full PNG
+        // re-upload, which is what stalls a slow SSH channel.
+        && (force || !this.#relayoutPendingImageKeys.has(key)))
+      .sort((left, right) => left[1].lastUsed - right[1].lastUsed)
+      .slice(0, excess);
+    if (idle.length === 0) return [];
+    const commands: string[] = [];
+    for (const [key, image] of idle) {
+      commands.push(kittyDeleteImage(image.imageId));
+      this.#terminalImages.delete(key);
+      this.#imageRetries.delete(key);
+      this.#blockedImageKeys.delete(key);
+    }
+    return commands;
+  }
+
+  #evictIdleTerminalImages(force = false): void {
+    const commands = this.#takeIdleTerminalImageEvictions(force);
+    if (commands.length === 0) return;
+    this.#writeGraphicsTransaction(commands.join(""));
+    this.#debug(`evicted ${commands.length} idle terminal image(s); rendered PNG cache retained`);
+  }
+
+  #pruneDetachedPlacements(
+    targetSize: number,
+    forceIdleImages = false,
+    enforceImageBudget = false
+  ): number {
+    if (this.#detachedPlacements.size <= targetSize
+      && (!enforceImageBudget
+        || this.#budgetedTerminalImages() <= this.#maxTerminalImages)) return 0;
+
+    // Map insertion order is detach order. Delete the oldest Ghostty pins one
+    // at a time, decrementing shared image references exactly once. Under the
+    // image budget, 4096 copies of one formula remain because they still use a
+    // single upload; unique historical formulas shed their oldest pin until an
+    // upload becomes idle and the configured image bound is restored.
+    const commands: string[] = [];
+    let removed = 0;
+    let removedImages = 0;
+    while (this.#detachedPlacements.size > targetSize
+      || (enforceImageBudget && this.#budgetedTerminalImages() > this.#maxTerminalImages)) {
+      const placement = this.#detachedPlacements.values().next().value as
+        | PlacedFormula
+        | undefined;
+      if (!placement) break;
+      commands.push(kittyDeletePlacement(placement.imageId, placement.placementId));
+      this.#deleteDetachedPlacement(placement);
+      removed += 1;
+      const imageDeletes = this.#takeIdleTerminalImageEvictions(false);
+      removedImages += imageDeletes.length;
+      commands.push(...imageDeletes);
+    }
+    // Keep placement and upload deletion in one ordered transaction. In the
+    // shared-image case this returns no image delete until its last placement
+    // reference is gone.
+    const imageDeletes = this.#takeIdleTerminalImageEvictions(forceIdleImages);
+    removedImages += imageDeletes.length;
+    commands.push(...imageDeletes);
+    if (this.#capabilities.kittyGraphics) this.#writeGraphicsTransaction(commands.join(""));
+    this.#debug(
+      `evicted ${removed} oldest detached formula placement(s)`
+      + (removedImages > 0 ? ` and ${removedImages} idle terminal image(s)` : "")
+    );
+    return removed;
+  }
+
+  #markersForRegion(region: FormulaPlacementPlan): { startMarker?: IMarker; endMarker?: IMarker } {
+    const buffer = this.terminal.buffer.active;
+    if (buffer.type !== "normal") return {};
+    const cursorAbsoluteRow = buffer.baseY + buffer.cursorY;
+    const startAbsoluteRow = buffer.viewportY + region.canvas.startRow;
+    const endAbsoluteRow = buffer.viewportY + region.canvas.endRow;
+    return {
+      startMarker: this.terminal.registerMarker(startAbsoluteRow - cursorAbsoluteRow),
+      endMarker: this.terminal.registerMarker(endAbsoluteRow - cursorAbsoluteRow)
+    };
+  }
+
+  #nextImageId(): number {
+    const imageId = this.#imageId++;
+    if (this.#imageId > TFORMULA_IMAGE_ID_MAX) this.#imageId = TFORMULA_IMAGE_ID_MIN;
+    this.#allocatedImageIds.add(imageId);
+    return imageId;
+  }
+
+  #nextPlacementId(): number {
+    const placementId = this.#placementId++;
+    if (this.#placementId > 2_147_483_647) this.#placementId = 1;
+    return placementId;
+  }
+
+  dispose(): void {
+    void this.closeFormulaFocus();
+    this.#disposed = true;
+    if (this.#scanTimer) clearTimeout(this.#scanTimer);
+    this.#scanTimer = undefined;
+    this.#scanTimerDueAt = 0;
+    this.#scanTimerRetryOnly = false;
+    for (const resolve of this.#scanWaiters.splice(0)) resolve();
+    for (const resolve of this.#writeWaiters.splice(0)) resolve();
+    for (const resolve of this.#layoutWaiters.splice(0)) resolve();
+    if (this.#presentation) {
+      // Preserve normal-buffer pins, including scrollback: concealed source
+      // remains copyable beneath those transparent images after process exit.
+      // Alternate-buffer images are owned by that buffer and disappear on exit.
+      this.#presentation.dispose();
+    } else this.resetPlacements();
+    this.terminal.dispose();
+  }
+
+  #formulaSnapshot(): PlannedFormulaSnapshot {
+    const buffer = this.terminal.buffer.active;
+    const viewportY = buffer.viewportY;
+    const visibleBufferLines = Array.from(
+      { length: this.terminal.rows },
+      (_, row) => buffer.getLine(viewportY + row)
+    );
+    const visibleTexts = visibleBufferLines.map((line) => line?.translateToString(true) ?? "");
+    if (!visibleTexts.some(containsFormulaTrigger)) return { regions: [], deferred: [] };
+
+    // Syntax can start just above the viewport while an Agent is streaming a
+    // long display. Include bounded read-only scrollback so rows such as `&=`
+    // are still known to belong to an unclosed `[`/`\[`/`$$`/environment.
+    // Returned coordinates remain viewport-relative and partial/off-screen
+    // regions are filtered before any Kitty placement is prepared.
+    const contextStart = Math.max(0, viewportY - MAX_DISPLAY_BLOCK_ROWS);
+    const contextRows = viewportY - contextStart;
+    const bufferLines = Array.from(
+      { length: contextRows + this.terminal.rows },
+      (_, index) => buffer.getLine(contextStart + index)
+    );
+    const physicalLines = bufferLines.map((line, index) => ({
+      row: index - contextRows,
+      text: index >= contextRows
+        ? visibleTexts[index - contextRows]!
+        : line?.translateToString(true) ?? "",
+      isWrapped: line?.isWrapped ?? false
+    }));
+    const nextLine = buffer.getLine(viewportY + this.terminal.rows);
+    const continuesAfterViewport = nextLine?.isWrapped ?? false;
+    const plannedSnapshot = (
+      snapshot: ReturnType<typeof detectScreenFormulaRegions>,
+      lines: typeof physicalLines
+    ): PlannedFormulaSnapshot => ({
+      regions: planFormulaPlacements(
+        snapshot.formulas,
+        lines,
+        this.terminal.cols
+      ),
+      deferred: snapshot.deferred
+    });
+    const visibleSnapshot = (snapshot: PlannedFormulaSnapshot): PlannedFormulaSnapshot => ({
+      regions: snapshot.regions.filter((region) =>
+        region.canvas.startRow >= 0 && region.canvas.endRow < this.terminal.rows
+      ),
+      deferred: snapshot.deferred.filter((region) =>
+        region.startRow >= 0 && region.endRow < this.terminal.rows
+      )
+    });
+    const quickSnapshot = visibleSnapshot(
+      plannedSnapshot(
+        detectScreenFormulaRegions(
+          physicalLines,
+          this.terminal.cols,
+          continuesAfterViewport,
+          this.#strictDetection
+        ),
+        physicalLines
+      )
+    );
+
+    // Most TUI frames contain no formula at all. Avoid walking every xterm
+    // cell, hashing its rendition, and allocating UTF-16/column maps until the
+    // string-only pass proves that detailed coordinates are actually needed.
+    if (quickSnapshot.regions.length === 0) return quickSnapshot;
+
+    const detailedRows = new Set<number>();
+    const addWrappedLogicalLine = (row: number): void => {
+      let start = row + contextRows;
+      while (start > 0 && physicalLines[start]!.isWrapped) start -= 1;
+      let end = row + contextRows;
+      while (end + 1 < physicalLines.length && physicalLines[end + 1]!.isWrapped) end += 1;
+      for (let physicalRow = start; physicalRow <= end; physicalRow += 1) {
+        detailedRows.add(physicalRow);
+      }
+    };
+    for (const region of quickSnapshot.regions) {
+      for (let row = region.canvas.startRow; row <= region.canvas.endRow; row += 1) {
+        addWrappedLogicalLine(row);
+      }
+    }
+    const detailedLines = bufferLines.map((line, row) => {
+      if (!detailedRows.has(row)) return physicalLines[row]!;
+      return {
+        row: physicalLines[row]!.row,
+        ...lineTextSnapshot(line, physicalLines[row]!.text),
+        isWrapped: line?.isWrapped ?? false
+      };
+    });
+    return visibleSnapshot(
+      plannedSnapshot(
+        detectScreenFormulaRegions(
+          detailedLines,
+          this.terminal.cols,
+          continuesAfterViewport,
+          this.#strictDetection
+        ),
+        detailedLines
+      )
+    );
+  }
+
+  #incompleteControlSuffix(data: string): string {
+    const escapeIndex = data.lastIndexOf("\x1b");
+    const c1Index = data.lastIndexOf("\u009b");
+    const controlIndex = Math.max(escapeIndex, c1Index);
+    if (controlIndex < 0) return "";
+    const suffix = data.slice(controlIndex);
+    if (controlIndex === c1Index) {
+      return /[\x40-\x7e]/u.test(suffix.slice(1)) ? "" : suffix.slice(-32);
+    }
+    if (suffix === "\x1b") return suffix;
+    if (!suffix.startsWith("\x1b[")) return "";
+    // A CSI sequence is incomplete until its final byte in the 0x40-0x7e
+    // range arrives. Keep only that suffix for split PTY writes.
+    return /[\x40-\x7e]/u.test(suffix.slice(2)) ? "" : suffix.slice(-32);
+  }
+
+  #regionPresentation(region: FormulaPlacementPlan): {
+    invisible: boolean;
+    foreground: string;
+    background: string;
+  } {
+    const buffer = this.terminal.buffer.active;
+    const ranges = region.sourceMasks.length
+      ? region.sourceMasks.map((segment) => ({
+          row: region.canvas.startRow + segment.rowOffset,
+          startCol: region.canvas.startCol + segment.startCol,
+          endCol: region.canvas.startCol + segment.endCol
+        }))
+      : Array.from(
+          { length: region.canvas.endRow - region.canvas.startRow + 1 },
+          (_, offset) => ({
+            row: region.canvas.startRow + offset,
+            startCol: region.canvas.startCol,
+            endCol: region.canvas.endCol
+          })
+        );
+    let invisible = false;
+    let bodyCell: IBufferCell | undefined;
+    let fallbackCell: IBufferCell | undefined;
+    for (const range of ranges) {
+      const line = buffer.getLine(buffer.viewportY + range.row);
+      if (!line) continue;
+      for (let column = Math.max(0, range.startCol);
+        column < Math.min(this.terminal.cols, range.endCol);
+        column += 1) {
+        const cell = line.getCell(column);
+        if (!cell || cell.getWidth() === 0) continue;
+        const chars = cell.getChars();
+        if (chars && cell.isInvisible()) invisible = true;
+        if (!fallbackCell && /\S/u.test(chars)) fallbackCell = cell;
+        if (!bodyCell && /[^\s\\()[\]$]/u.test(chars)) bodyCell = cell;
+      }
+    }
+    // Never turn SGR 8 concealed source into a visible image. Checking every
+    // occupied source cell also protects partially concealed expressions.
+    const cell = bodyCell ?? fallbackCell;
+    if (!cell) {
+      return {
+        invisible,
+        foreground: this.#capabilities.foreground,
+        background: this.#capabilities.background
+      };
+    }
+
+    let foreground = cell.isFgRGB()
+      ? rgbHex(cell.getFgColor())
+      : cell.isFgPalette()
+        ? paletteHex(cell.getFgColor())
+        : this.#capabilities.foreground;
+    let background = cell.isBgRGB()
+      ? rgbHex(cell.getBgColor())
+      : cell.isBgPalette()
+        ? paletteHex(cell.getBgColor())
+        : this.#capabilities.background;
+    if (cell.isInverse()) [foreground, background] = [background, foreground];
+    return { invisible, foreground, background };
+  }
+
+  #regionSourceText(region: FormulaPlacementPlan): string {
+    const buffer = this.terminal.buffer.active;
+    return Array.from(
+      { length: region.canvas.endRow - region.canvas.startRow + 1 },
+      (_, offset) => buffer.getLine(buffer.viewportY + region.canvas.startRow + offset)
+        ?.translateToString(true) ?? ""
+    ).join("\n");
+  }
+
+  #anchor(
+    region: FormulaPlacementPlan,
+    bufferType: string,
+    viewportY: number
+  ): string {
+    // An embedded display owns a full-width transparent canvas, so the canvas
+    // origin is not a formula identity. Two distinct `$$...$$` spans on one
+    // text row would otherwise receive the same key and the latter placement
+    // would delete the former. The first source mask is the formula's stable
+    // physical origin; unlike the canvas, it also remains constant when a
+    // neighboring blank row is borrowed or released.
+    const source = region.sourceMasks.reduce((first, candidate) => {
+      if (!first) return candidate;
+      return candidate.rowOffset < first.rowOffset
+        || (candidate.rowOffset === first.rowOffset && candidate.startCol < first.startCol)
+        ? candidate
+        : first;
+    }, undefined as FormulaPlacementPlan["sourceMasks"][number] | undefined);
+    const row = region.canvas.startRow + (source?.rowOffset ?? 0);
+    const column = region.canvas.startCol + (source?.startCol ?? 0);
+    return `${bufferType}:${viewportY + row}:${column}`;
+  }
+
+  /**
+   * Whether a `${anchor}|${fingerprint}` retry/block key names an alternate row
+   * a scroll could have moved. Kept beside #anchor() on purpose: the row is read
+   * straight back out of the string the method above writes, and a parallel copy
+   * carried in the map and the set would be a second source of truth that can
+   * only ever drift from the anchor the key is built from. An unrecognised shape
+   * counts as moved, which is the old, conservative all-keys clearing.
+   *
+   * The anchor's row is the topmost-leftmost source mask, not the canvas origin,
+   * so a canvas may reach rows this test ignores. That is not a gap: the canvas
+   * is part of the fingerprint, so a scroll that changes which blank rows a
+   * formula may borrow produces a different key and therefore a fresh ladder
+   * without any clearing here. A key that survives a scroll unchanged describes
+   * a formula whose source text and canvas both stayed put, and whose failure is
+   * reproducible — exactly the case that must keep counting toward the ceiling.
+   */
+  #alternateKeyWasMoved(key: string, dirty?: { start: number; end: number }): boolean {
+    if (!key.startsWith("alternate:")) return false;
+    if (!dirty) return true;
+    // Digits rather than Number.isInteger: Number("") and Number(" ") are 0, so
+    // a degenerate "alternate:" key read as row 0 and was cleared only when the
+    // band happened to start there, instead of taking the conservative branch
+    // this guard exists to provide. "1e3" and "0x10" pass isInteger too. What
+    // #anchor() writes is `${nonNegativeInteger}`, which never takes any of
+    // those forms, so no key a scan can produce changes branch here.
+    const rowText = key.split(":", 3)[1];
+    if (!/^\d+$/.test(rowText)) return true;
+    const row = Number(rowText);
+    return row >= dirty.start && row <= dirty.end;
+  }
+
+  #regionIdentity(region: FormulaPlacementPlan): string {
+    return JSON.stringify(region);
+  }
+
+  #formulaStabilityKey(
+    region: FormulaPlacementPlan,
+    viewportY: number,
+    bufferType: string
+  ): string {
+    return `${bufferType}:${viewportY}:${this.#regionIdentity(region)}`;
+  }
+
+  /**
+   * Identify a formula by everything MathJax typesetting depends on: the source
+   * text, whether it is typeset in display mode, and the container width. The
+   * width is canonical for everything except a multi-row, non-sliced display
+   * formula, which MathJax linebreaks to the region — a source that fails only
+   * because it could not be broken into a narrow pane must be retried when the
+   * pane widens, rather than staying raw for the rest of the session. Colours
+   * and the exact anchor are excluded, unlike the placement fingerprint, so a
+   * repainted TUI frame reuses the key instead of minting a new one.
+   */
+  #unparseableFormulaKey(region: FormulaPlacementPlan): string {
+    const containerWidth = mathJaxContainerWidthForPlacement(
+      region,
+      this.#capabilities,
+      this.#scale
+    );
+    return `${region.formula.intent !== "inline" ? "display" : "inline"}|${containerWidth}|${
+      createHash("sha1").update(region.formula.latex).digest("hex")
+    }`;
+  }
+
+  #rememberUnparseableFormula(key: string): void {
+    this.#unparseableFormulaKeys.add(key);
+    // A session that keeps mis-detecting fresh prose as TeX would otherwise
+    // grow this set without bound; the oldest entries are the least likely to
+    // still be on screen.
+    while (this.#unparseableFormulaKeys.size > MAX_UNPARSEABLE_FORMULAS) {
+      this.#unparseableFormulaKeys.delete(
+        this.#unparseableFormulaKeys.values().next().value!
+      );
+    }
+  }
+
+  /** Return zero when stable, otherwise the remaining quiet-period delay. */
+  #observeFormulaStability(key: string, forceStable: boolean): number {
+    const now = Date.now();
+    let state = this.#formulaStability.get(key);
+    if (!state) {
+      state = { firstSeenAt: now, stable: forceStable || this.#stabilityMs === 0 };
+      this.#formulaStability.set(key, state);
+    }
+    if (forceStable) state.stable = true;
+    if (state.stable) return 0;
+    const remaining = this.#stabilityMs - (now - state.firstSeenAt);
+    if (remaining > 0) return remaining;
+    state.stable = true;
+    return 0;
+  }
+
+  #regionStillVisible(region: FormulaPlacementPlan, viewportY: number, bufferType: string): boolean {
+    const buffer = this.terminal.buffer.active;
+    if (buffer.viewportY !== viewportY || buffer.type !== bufferType) return false;
+    const version = this.#scanVersion;
+    let cached = this.#regionValidationCache;
+    if (!cached
+      || cached.version !== version
+      || cached.viewportY !== viewportY
+      || cached.bufferType !== bufferType) {
+      cached = {
+        version,
+        viewportY,
+        bufferType,
+        identities: new Set(
+          this.#formulaSnapshot().regions.map((candidate) => this.#regionIdentity(candidate))
+        )
+      };
+      this.#regionValidationCache = cached;
+    }
+    return cached.identities.has(this.#regionIdentity(region));
+  }
+
+  #replacementForRegion(
+    anchor: string,
+    region: FormulaPlacementPlan,
+    bufferType: string,
+    viewportY: number,
+    claimedAnchors: ReadonlySet<string>
+  ): { anchor: string; placement: PlacedFormula } | undefined {
+    const exact = claimedAnchors.has(anchor) ? undefined : this.#placed.get(anchor);
+    if (exact) return { anchor, placement: exact };
+    const start = viewportY + region.canvas.startRow;
+    const end = viewportY + region.canvas.endRow;
+    for (const [oldAnchor, placement] of this.#placed) {
+      if (claimedAnchors.has(oldAnchor)) continue;
+      if (placement.bufferType !== bufferType || placement.latex !== region.formula.latex) continue;
+      const bounds = this.#placementBounds(placement);
+      if (bounds.start < 0 || bounds.end < 0) continue;
+      if (bounds.start <= end && bounds.end >= start) {
+        return { anchor: oldAnchor, placement };
+      }
+    }
+    // Widening can merge the wrapped continuation row containing a visible
+    // inline formula into a non-overlapping row and dispose both markers. The
+    // pre-resize layout hint still identifies a valid replacement candidate;
+    // choose the nearest unclaimed one so repeated identical formulas pair in
+    // visual order instead of leaving duplicate Ghostty pins behind.
+    const candidates = Array.from(this.#placed.entries())
+      .filter(([oldAnchor, placement]) => !claimedAnchors.has(oldAnchor)
+        && placement.bufferType === bufferType
+        && placement.latex === region.formula.latex
+        && placement.layoutHint
+        && ![placement.startMarker, placement.endMarker].some((marker) =>
+          Boolean(marker && !marker.isDisposed && marker.line >= 0)
+        ))
+      .sort((left, right) => {
+        const leftDistance = Math.abs(left[1].layoutHint!.start - start);
+        const rightDistance = Math.abs(right[1].layoutHint!.start - start);
+        return leftDistance - rightDistance;
+      });
+    if (candidates[0]) return { anchor: candidates[0][0], placement: candidates[0][1] };
+    return undefined;
+  }
+
+  #placementExactlyTracksRegion(
+    placement: PlacedFormula,
+    region: FormulaPlacementPlan,
+    bufferType: string,
+    viewportY: number
+  ): boolean {
+    if (placement.bufferType !== bufferType || placement.latex !== region.formula.latex) return false;
+    // Normal-buffer absolute row numbers are reused after xterm reaches its
+    // scrollback limit. Once both markers have expired, layoutHint is only a
+    // resize fallback; it is not proof that an old placement belongs to new
+    // text which later occupies the same absolute row and anchor.
+    if (bufferType === "normal") {
+      const hasLiveMarker = [placement.startMarker, placement.endMarker].some((marker) =>
+        Boolean(marker && !marker.isDisposed && marker.line >= 0)
+      );
+      if (!hasLiveMarker) return false;
+    }
+    const bounds = this.#placementBounds(placement);
+    return bounds.start === viewportY + region.canvas.startRow
+      && bounds.end === viewportY + region.canvas.endRow;
+  }
+
+  async #scan(allowQueuedWrites = false, forceStable = false, cachedOnly = false): Promise<void> {
+    if (this.#disposed || !this.#capabilities.kittyGraphics || this.terminal.modes.originMode) return;
+    if ((!allowQueuedWrites && this.#pendingWrites > 0) || this.#layoutSuspended) {
+      this.#rescanRequested = true;
+      return;
+    }
+    if (this.#scanning) {
+      this.#rescanRequested = true;
+      return;
+    }
+
+    this.#scanning = true;
+    this.#rescanRequested = false;
+    if (this.terminal.buffer.active.type === "alternate" && this.#alternateDirtyRows) {
+      if (this.#alternate47Restored) {
+        // Ghostty itself tracks the retained placement pins through scrolling;
+        // the xterm mirror does not contain the retained rows to reconstruct.
+        this.#alternateDirtyRows = undefined;
+      } else {
+        this.#invalidateDirtyAlternatePlacements();
+      }
+    }
+    const version = this.#scanVersion;
+    const layoutVersion = this.#layoutVersion;
+    const activeBuffer = this.terminal.buffer.active;
+    const viewportY = activeBuffer.viewportY;
+    const bufferType = activeBuffer.type;
+    let retryDelay: number | undefined;
+    let stabilityRetryDelay: number | undefined;
+    const observedStabilityKeys = new Set<string>();
+    try {
+      this.#detachExpiredMarkerPlacements();
+      const snapshot = this.#formulaSnapshot();
+      const regions = snapshot.regions;
+      const prepared = regions.flatMap((region) => {
+        this.#rememberFormula(region);
+        const presentation = this.#regionPresentation(region);
+        if (presentation.invisible) return [];
+        const rows = region.canvas.endRow - region.canvas.startRow + 1;
+        const columns = region.canvas.endCol - region.canvas.startCol;
+        const plan = region;
+        const anchor = this.#anchor(region, bufferType, viewportY);
+        return [{
+          region,
+          plan,
+          rows,
+          columns,
+          anchor,
+          colors: {
+            foreground: presentation.foreground,
+            background: presentation.background
+          }
+        }];
+      });
+      const desiredAnchors = new Set(prepared.map(({ anchor }) => anchor));
+      // A resize can move the same formula to a new anchor. Keep its last
+      // successfully committed placement until the replacement is actually
+      // emitted; render errors and graphics retry backoff must not create a
+      // raw-text gap in between.
+      const retainedReplacementAnchors = new Set<string>();
+      const claimedReplacementAnchors = new Set<string>();
+
+      for (const { region, plan, rows, columns, anchor, colors } of prepared) {
+        if (this.#disposed
+          || (!allowQueuedWrites && this.#pendingWrites > 0)
+          || this.#layoutSuspended
+          || layoutVersion !== this.#layoutVersion
+          || this.terminal.buffer.active.type !== bufferType) break;
+        let renderColors = colors;
+        if (version !== this.#scanVersion) {
+          if (!this.#regionStillVisible(region, viewportY, bufferType)) continue;
+          const currentPresentation = this.#regionPresentation(region);
+          if (currentPresentation.invisible) continue;
+          renderColors = {
+            foreground: currentPresentation.foreground,
+            background: currentPresentation.background
+          };
+        }
+        let replacement = this.#replacementForRegion(
+          anchor,
+          region,
+          bufferType,
+          viewportY,
+          claimedReplacementAnchors
+        );
+        let existing = replacement?.placement;
+        if (replacement?.anchor === anchor
+          && existing
+          && (existing.bufferType !== bufferType
+            || existing.latex !== region.formula.latex)) {
+          // An anchor identifies terminal coordinates, not content. A TUI can
+          // overwrite those cells with a different formula, and absolute row
+          // numbers are also recycled at the scrollback cap. Do not leave the
+          // old, semantically wrong image covering the new source while its
+          // render is pending or failing.
+          this.#writeGraphicsTransaction(
+            kittyDeletePlacement(existing.imageId, existing.placementId)
+          );
+          this.#releasePlacement(existing);
+          this.#placed.delete(replacement.anchor);
+          replacement = undefined;
+          existing = undefined;
+        }
+        const reportNewOccurrence = !replacement;
+        if (replacement) {
+          claimedReplacementAnchors.add(replacement.anchor);
+          retainedReplacementAnchors.add(replacement.anchor);
+        }
+        // Only the retention bookkeeping above has to precede this test. A
+        // source blocked at some other geometry can still own a correct image
+        // here, and the sweep at the end of the scan deletes every placement
+        // that was not retained; past that point a blocked source needs
+        // nothing else from this iteration. Leaving before the plan
+        // fingerprint is what keeps a repainting TUI from hashing the full
+        // source, masks and slices of a formula it has already given up on,
+        // once per frame.
+        const unparseableKey = this.#unparseableFormulaKey(plan);
+        if (this.#unparseableFormulaKeys.has(unparseableKey)) continue;
+        const fingerprint = createHash("sha1").update(JSON.stringify({
+          formula: plan.formula,
+          canvas: plan.canvas,
+          mode: plan.mode,
+          estimatedQuality: plan.estimatedQuality,
+          displayRange: plan.displayRange,
+          composite: plan.composite,
+          sourceMasks: plan.sourceMasks,
+          formulaSlices: plan.formulaSlices,
+          colors: renderColors,
+          cell: this.#capabilities.cell,
+          scale: this.#scale
+        })).digest("hex");
+        if (replacement?.anchor === anchor
+          && existing?.fingerprint === fingerprint
+          && existing.resizeGeneration === this.#resizeGeneration
+          && this.#placementExactlyTracksRegion(existing, region, bufferType, viewportY)) {
+          // Live markers are now authoritative at the current geometry. Do not
+          // let an old resize fallback survive until those markers eventually
+          // expire at the scrollback cap and make an evicted row look live.
+          existing.layoutHint = undefined;
+          existing.layoutHintTrimGeneration = undefined;
+          if (existing.transparentCanvas) {
+            await this.#writeGraphicsTransaction(() => this.#sourceVisibility(plan));
+          }
+          continue;
+        }
+        const placementRetryKey = `${anchor}|${fingerprint}`;
+        if (this.#blockedPlacementKeys.has(placementRetryKey)) continue;
+        const stabilityKey = this.#formulaStabilityKey(region, viewportY, bufferType);
+        if (!existing) {
+          observedStabilityKeys.add(stabilityKey);
+          const stabilityDelay = this.#observeFormulaStability(stabilityKey, forceStable);
+          if (stabilityDelay > 0) {
+            stabilityRetryDelay = Math.min(
+              stabilityRetryDelay ?? stabilityDelay,
+              stabilityDelay
+            );
+            this.#debug(`collecting formula at ${anchor}; waiting ${Math.ceil(stabilityDelay)} ms for stability`);
+            continue;
+          }
+        }
+        const placementRetry = this.#placementRetries.get(placementRetryKey);
+        if (placementRetry && placementRetry.notBefore > Date.now()) {
+          const remaining = placementRetry.notBefore - Date.now();
+          retryDelay = Math.min(retryDelay ?? remaining, remaining);
+          continue;
+        }
+
+        try {
+          const transparent = Boolean(this.#presentation) && this.#sourceVisibility(plan) !== undefined;
+          const background = transparent ? "transparent" : renderColors.background;
+          const cached = cachedOnly ? this.#renderer.cachedPlacement(plan, this.#capabilities,
+            this.#scale, renderColors.foreground, background) : undefined;
+          if (cachedOnly && !cached) {
+            this.#cachedScanMiss = true;
+            retryDelay = Math.min(retryDelay ?? 16, 16);
+            continue;
+          }
+          const rendered = cached ?? await this.#renderer.renderPlacement(
+            plan,
+            this.#capabilities,
+            this.#scale,
+            renderColors.foreground,
+            background
+          );
+          if (this.#disposed
+            || (!allowQueuedWrites && this.#pendingWrites > 0)
+            || this.#layoutSuspended
+            || layoutVersion !== this.#layoutVersion
+            || this.terminal.buffer.active.type !== bufferType) break;
+          if (this.terminal.modes.originMode) {
+            // Origin mode may have changed while MathJax was awaited even if
+            // the formula stayed visible. Synchronized output is safe here:
+            // #writeGraphicsTransaction appends commands to the Agent frame
+            // without closing it.
+            this.#rescanRequested = true;
+            break;
+          }
+          // Unrelated output (for example a spinner in the status bar) should
+          // not starve formulas that are unchanged at their screen location.
+          if (version !== this.#scanVersion) {
+            if (!this.#regionStillVisible(region, viewportY, bufferType)) continue;
+            const currentPresentation = this.#regionPresentation(region);
+            if (currentPresentation.invisible
+              || currentPresentation.foreground !== renderColors.foreground
+              || currentPresentation.background !== renderColors.background) {
+              this.#rescanRequested = true;
+              continue;
+            }
+          }
+
+          if (rendered.fitScale < this.#minReadableScale) {
+            this.#rememberFormula(plan, {
+              fitScale: rendered.fitScale,
+              degradationReason: `fit scale ${rendered.fitScale.toFixed(3)} below ${this.#minReadableScale.toFixed(3)}`
+            });
+            // A tiny but technically successful rasterization is less useful
+            // than the original TeX. Remember this exact layout variant so
+            // unrelated screen updates do not repeatedly render it; a resize
+            // or newly available blank row changes the key and retries.
+            this.#blockedPlacementKeys.add(placementRetryKey);
+            if (existing && replacement) {
+              await this.#writeGraphicsTransaction(
+                kittyDeletePlacement(existing.imageId, existing.placementId)
+              );
+              this.#releasePlacement(existing);
+              this.#placed.delete(replacement.anchor);
+              retainedReplacementAnchors.delete(replacement.anchor);
+            }
+            this.#formulaStability.delete(stabilityKey);
+            this.#debug(
+              `kept raw TeX at ${anchor}: fitted scale ${rendered.fitScale.toFixed(3)} is below ${this.#minReadableScale.toFixed(3)}`
+            );
+            continue;
+          }
+
+          const buffer = this.terminal.buffer.active;
+          // CUP cannot reproduce xterm's pending-wrap state exactly. An idle
+          // resize can leave both xterm and Ghostty in that state, so require
+          // a lossless right-edge replay before moving the real cursor.
+          if (buffer.cursorX >= this.terminal.cols
+            && this.#pendingWrapHeldColumns === undefined
+            && this.#pendingWrapReplay() === undefined) {
+            this.#debug("formula placement deferred while cursor is in pending-wrap state");
+            break;
+          }
+          const terminalImageKey = `${buffer.type}:${rendered.cacheKey}`;
+          if (this.#blockedImageKeys.has(terminalImageKey)) continue;
+          const retry = this.#imageRetries.get(terminalImageKey);
+          if (retry && retry.notBefore > Date.now()) {
+            const remaining = retry.notBefore - Date.now();
+            retryDelay = Math.min(retryDelay ?? remaining, remaining);
+            continue;
+          }
+          let image = this.#terminalImages.get(terminalImageKey);
+          let transmission = "";
+          let createdImage = false;
+          if (!image) {
+            image = {
+              imageId: this.#nextImageId(),
+              placements: 0,
+              lastUsed: ++this.#imageUse
+            };
+            transmission = this.#transmitImage(rendered.png, image.imageId);
+            this.#terminalImages.set(terminalImageKey, image);
+            createdImage = true;
+          }
+          // Image upload is cursor-neutral.  Drain it separately so a resize
+          // during a large direct-PNG transfer cannot leave an old CUP/place/
+          // cursor-restore sequence waiting behind the upload.
+          if (transmission) {
+            try {
+              const uploaded = await this.#writeGraphicsTransaction(() =>
+                this.#disposed ? undefined : transmission
+              );
+              if (!uploaded) {
+                if (createdImage) this.#terminalImages.delete(terminalImageKey);
+                break;
+              }
+            } catch (error) {
+              if (createdImage) this.#terminalImages.delete(terminalImageKey);
+              throw error;
+            }
+          }
+          if (this.#disposed
+            || this.#layoutSuspended
+            || layoutVersion !== this.#layoutVersion
+            || this.terminal.buffer.active.type !== bufferType) {
+            // The uploaded image is content-addressed and remains reusable.
+            // Only its cell-addressed placement needs a fresh scan.
+            this.#rescanRequested = true;
+            this.#evictIdleTerminalImages();
+            break;
+          }
+          const placementId = this.#nextPlacementId();
+          let emitted = false;
+          try {
+            emitted = await this.#writeGraphicsTransaction(() => {
+              if (this.#disposed
+                || this.#layoutSuspended
+                || layoutVersion !== this.#layoutVersion
+                || this.terminal.buffer.active.type !== bufferType) return undefined;
+              const restoreCursor = this.#cursorRestoreAfterGraphics();
+              if (!restoreCursor) return undefined;
+              const sourceConcealment = transparent ? this.#sourceVisibility(plan) : "";
+              if (sourceConcealment === undefined) return undefined;
+              return [
+                existing ? kittyDeletePlacement(existing.imageId, existing.placementId) : "",
+                sourceConcealment,
+                cursorPosition(plan.canvas.startRow + 1, plan.canvas.startCol + 1),
+                kittyPlaceImage(image.imageId, placementId, columns, rows),
+                restoreCursor
+              ].join("");
+            });
+          } catch (error) {
+            if (createdImage) this.#terminalImages.delete(terminalImageKey);
+            throw error;
+          }
+          if (!emitted) {
+            this.#rescanRequested = true;
+            break;
+          }
+          if (this.#disposed
+            || this.#layoutSuspended
+            || layoutVersion !== this.#layoutVersion
+            || this.terminal.buffer.active.type !== bufferType) {
+            // SIGWINCH can arrive after the guarded transaction starts. It is
+            // then too late to cancel its APC, but no child output can overtake
+            // this scan in TerminalWriter. Delete the provisional placement
+            // and restore the real cursor from the newly reflowed mirror before
+            // releasing the output queue.
+            await this.#writeGraphicsTransaction(() => {
+              if (this.#disposed) return kittyDeletePlacement(image.imageId, placementId);
+              return kittyDeletePlacement(image.imageId, placementId)
+                + (this.#cursorRestoreAfterGraphics() ?? "");
+            });
+            if (existing) {
+              this.#releasePlacement(existing);
+              this.#placed.delete(replacement!.anchor);
+              retainedReplacementAnchors.delete(replacement!.anchor);
+            }
+            this.#rescanRequested = true;
+            break;
+          }
+          if (existing) {
+            this.#releasePlacement(existing);
+            this.#placed.delete(replacement!.anchor);
+            retainedReplacementAnchors.delete(replacement!.anchor);
+          }
+          image.placements += 1;
+          image.lastUsed = ++this.#imageUse;
+          const markers = this.#markersForRegion(region);
+          this.#placed.set(anchor, {
+            ...(transparent ? { transparentCanvas: {
+              startCol: plan.canvas.startCol, endCol: plan.canvas.endCol
+            } } : {}),
+            anchor,
+            imageId: image.imageId,
+            placementId,
+            imageKey: terminalImageKey,
+            latex: region.formula.latex,
+            sourceText: this.#regionSourceText(region),
+            fingerprint,
+            resizeGeneration: this.#resizeGeneration,
+            bufferType: buffer.type,
+            absoluteStartRow: buffer.viewportY + region.canvas.startRow,
+            absoluteEndRow: buffer.viewportY + region.canvas.endRow,
+            ...markers
+          });
+          this.#formulaStability.delete(stabilityKey);
+          this.#rememberFormula(plan, {
+            fitScale: rendered.fitScale,
+            degradationReason: null
+          });
+          this.#evictIdleTerminalImages();
+          this.#debug(
+            `rendered ${plan.formula.confidence} formula at ${anchor} (${rendered.widthPx}x${rendered.heightPx}px, fit ${rendered.fitScale.toFixed(3)}, canvas ${plan.mode})`
+          );
+          if (reportNewOccurrence && this.#onFormulaRendered) {
+            try {
+              this.#onFormulaRendered({
+                latex: plan.formula.latex,
+                display: plan.formula.intent !== "inline",
+                confidence: plan.formula.confidence
+              });
+            } catch (error) {
+              this.#debug(
+                `formula history callback failed: ${error instanceof Error ? error.message : String(error)}`
+              );
+            }
+          }
+        } catch (error) {
+          this.#rememberFormula(plan, {
+            degradationReason: `render failed: ${error instanceof Error ? error.message : String(error)}`
+          });
+          this.#debug(`formula render skipped: ${error instanceof Error ? error.message : String(error)}`);
+          // The old placement is the last known-good rendering of this exact
+          // LaTeX. Leave it in place; a later layout/output scan can replace it
+          // transactionally instead of exposing raw source on a transient
+          // MathJax or terminal-graphics failure.
+          if (error instanceof MathRenderError
+            && SOURCE_DETERMINED_RENDER_FAILURES.has(error.code)) {
+            // These failures are decided by the LaTeX source alone, so they
+            // recur identically at every geometry and the retry ladder can only
+            // burn renders. Record the source and skip the coordinate-keyed
+            // machinery, which a repainting TUI keeps resetting.
+            this.#rememberUnparseableFormula(unparseableKey);
+            this.#placementRetries.delete(placementRetryKey);
+            this.#debug(`formula at ${anchor} is unparseable; skipping it for this session`);
+            continue;
+          }
+          const attempt = (this.#placementRetries.get(placementRetryKey)?.attempt ?? 0) + 1;
+          if (attempt > 5) {
+            // Row-precise relayout clearing is what makes this ceiling
+            // reachable on the alternate screen. Every scroll used to reset the
+            // ladder of every alternate key, so a repainting TUI holding at
+            // least one placed formula retried a failing one without bound. A
+            // formula the dirty band does not cover now keeps its count, and
+            // its five attempts become a real budget: spending them leaves raw
+            // source at that position until a later scroll does cover the row
+            // -- an unrecognisable scroll shape still dirties every row -- or
+            // until resize(), DECSET 1049 re-entering the alternate screen,
+            // DECRST 1047 leaving it, or a clear/ED-2.
+            this.#placementRetries.delete(placementRetryKey);
+            this.#blockedPlacementKeys.add(placementRetryKey);
+            this.#debug(`formula variant at ${anchor} exceeded the render retry limit`);
+          } else {
+            const delay = Math.min(2_000, 50 * (2 ** (attempt - 1)));
+            this.#placementRetries.set(placementRetryKey, {
+              attempt,
+              notBefore: Date.now() + delay
+            });
+            retryDelay = Math.min(retryDelay ?? delay, delay);
+          }
+        }
+      }
+      // Stale placement deletion is deliberately transactional as well. A
+      // resize can invalidate an in-flight scan; deleting before all current
+      // formulas are prepared would permanently lose an image that has just
+      // moved into scrollback. Markers keep this visibility check valid after
+      // normal-buffer reflow.
+      if (layoutVersion === this.#layoutVersion && version === this.#scanVersion) {
+        for (const key of this.#formulaStability.keys()) {
+          if (!observedStabilityKeys.has(key)) this.#formulaStability.delete(key);
+        }
+        let detachedAfterLayout = 0;
+        for (const [anchor, placement] of this.#placed) {
+          const hasLiveMarker = [placement.startMarker, placement.endMarker].some((marker) =>
+            Boolean(marker && !marker.isDisposed && marker.line >= 0)
+          );
+          if (placement.bufferType === "normal"
+            && !hasLiveMarker
+            && placement.layoutHint
+            && !desiredAnchors.has(anchor)
+            && !retainedReplacementAnchors.has(anchor)
+            && !this.#placementIsVisible(placement)) {
+            // The hint served its one purpose: pairing a placement whose
+            // markers were destroyed by the just-completed visible reflow. If
+            // it is now wholly outside the stable viewport and no region has
+            // claimed it, keeping the static anchor would let a later xterm
+            // row recycle delete Ghostty's unrelated historical pin.
+            this.#detachPlacement(anchor, placement);
+            detachedAfterLayout += 1;
+            continue;
+          }
+          if (desiredAnchors.has(anchor)
+            || retainedReplacementAnchors.has(anchor)
+            || (bufferType === "alternate" && this.#alternate47Restored)
+            || !this.#placementIsVisible(placement)
+            || this.#partialPlacementSourceStillVisible(placement)) continue;
+          this.#writeOuter(kittyDeletePlacement(placement.imageId, placement.placementId));
+          this.#releasePlacement(placement);
+          this.#placed.delete(anchor);
+        }
+        if (detachedAfterLayout > 0) {
+          this.#debug(`detached ${detachedAfterLayout} off-screen resize placement(s)`);
+        }
+        // The screen is reconciled: every image a relayout unpinned has either
+        // been re-placed or belongs to a formula that is genuinely gone, so
+        // lift the eviction reservation before the budget is enforced again.
+        const reserved = this.#relayoutPendingImageKeys.size > 0;
+        this.#relayoutPendingImageKeys.clear();
+        this.#evictIdleTerminalImages();
+        // Detached pins are weighed against the budget only when a placement
+        // detaches, and one that detached during the reservation was weighed
+        // against a deferred count that nothing else would revisit. Run it after
+        // the idle sweep, never before: an unpinned upload is reclaimable, a
+        // historical Ghostty pin is the last copy of a formula in scrollback.
+        if (reserved && this.#detachedPlacements.size > 0) {
+          this.#pruneDetachedPlacements(this.#maxDetachedPlacements, false, true);
+        }
+      }
+    } finally {
+      if (this.#presentation && !this.#disposed && !this.#layoutSuspended) {
+        await this.#writeGraphicsTransaction(() => this.#sourceVisibility());
+      }
+      // A scan that never reached its reconciliation — disposed, layout
+      // suspended, a render throwing — must not leave images reserved. Each
+      // aborted attempt would otherwise strand another generation of them
+      // outside the eviction budget and grow #terminalImages without bound.
+      // Dropping the reservation costs at most one re-upload of a formula
+      // whose scan was interrupted anyway; the budget is never negotiable.
+      if (this.#relayoutPendingImageKeys.size > 0) {
+        this.#relayoutPendingImageKeys.clear();
+        // A continuously redrawing TUI bumps #layoutVersion every frame, which
+        // breaks the placement loop at its top guard before either the
+        // per-placement evictions or the reconciliation sweep can run. Lifting
+        // the reservation is not enough on its own: without a sweep here,
+        // nothing would enforce the image budget again until the output pauses
+        // long enough for a scan to complete.
+        if (!this.#disposed) {
+          this.#evictIdleTerminalImages();
+          if (this.#detachedPlacements.size > 0) {
+            this.#pruneDetachedPlacements(this.#maxDetachedPlacements, false, true);
+          }
+        }
+      }
+      this.#scanning = false;
+      for (const resolve of this.#scanWaiters.splice(0)) resolve();
+      if (!this.#disposed && (this.#rescanRequested || version !== this.#scanVersion)) {
+        this.#rescanRequested = false;
+        if (this.#pendingWrites === 0 && !this.#layoutSuspended) this.scheduleScan(140);
+      } else if (!this.#disposed && stabilityRetryDelay !== undefined) {
+        // Stability is a quiet-period debounce, not an error backoff. Keep its
+        // timer flushable so an output checkpoint can promote the complete
+        // formula immediately before later PTY rows scroll it away.
+        this.scheduleScan(Math.max(16, stabilityRetryDelay));
+      } else if (!this.#disposed && retryDelay !== undefined) {
+        this.scheduleScan(Math.max(16, retryDelay), true);
+      }
+    }
+  }
+}

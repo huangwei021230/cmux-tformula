@@ -1,0 +1,621 @@
+# TFormula
+
+[English](README.md) | [简体中文](README.zh-CN.md)
+
+This repository publishes a cmux middleware built on [TFormula](https://github.com/mikewang817/TFormula) 0.3.1 (MIT, copyright Mike Wang). It renders LaTeX as transparent images inside cmux, including cmux-managed SSH. Setup is in [CMUX.md](CMUX.md).
+
+Render scientific LaTeX directly inside **OpenAI Codex** and any other CLI
+agent, while keeping the terminal fully interactive.
+
+The primary TFormula workflow is intentionally this simple:
+
+```sh
+tformula codex
+```
+
+Codex continues to behave like the normal Codex CLI, but formulas in its live
+output are rendered in place instead of remaining as raw TeX. The Markdown and
+image reader is an additional mode for opening documents from the terminal.
+
+Every successfully rendered formula is also ready to reuse—without selecting
+or retyping it:
+
+```sh
+tformula copy mathml       # latest formula -> clipboard
+tformula save formula.png  # latest formula -> high-resolution image
+```
+
+> **Ghostty is the recommended terminal.** TFormula is developed and tested
+> primarily with Ghostty and also works with terminals that implement the Kitty
+> graphics protocol, including Kitty and WezTerm.
+
+TFormula is a terminal-agnostic PTY proxy. It does not use Codex, Claude,
+Gemini, or any other agent-specific API.
+
+The child program still sees a normal terminal. TFormula forwards its ANSI
+output unchanged, maintains a headless copy of the terminal screen, detects
+visible TeX, renders it locally with MathJax, and places the result over the
+source text using the Kitty graphics protocol. The original text remains in
+the terminal buffer for copying.
+
+## Quick start: Codex in Ghostty
+
+Install TFormula globally. With npm 11, allow the native setup scripts used by
+`node-pty` and the reader's `sharp` image pipeline:
+
+```sh
+npm install -g tformula --allow-scripts=node-pty --allow-scripts=sharp
+```
+
+Then start Codex through TFormula:
+
+```sh
+tformula codex
+```
+
+That is the complete integration—there is no Codex plugin or configuration to
+install. Codex itself must already be installed and available on your `PATH`.
+
+## See it in action
+
+This example shows Codex explaining Maxwell's equations in Ghostty.
+TFormula detects the LaTeX in the live terminal output and renders the equations
+in place without replacing the surrounding text.
+
+![TFormula rendering Codex's Maxwell equations in Ghostty](assets/tformula-maxwell.png)
+
+## Other CLI agents
+
+The same PTY wrapper works with other terminal agents:
+
+| Agent | Command |
+|---|---|
+| OpenAI Codex | `tformula codex` |
+| Claude Code | `tformula claude` |
+| Cursor Agent | `tformula agent` |
+| Pi coding agent | `tformula pi` |
+| Gemini CLI | `tformula gemini` |
+| OpenCode | `tformula opencode` |
+| Aider | `tformula aider` |
+| Goose | `tformula goose` |
+| Qwen Code | `tformula qwen` |
+| Any other CLI agent | `tformula -- <agent-command> [args...]` |
+
+`--shell` starts an enhanced login shell, so commands launched inside that
+shell can be wrapped without creating an alias for each agent:
+
+```sh
+tformula --shell
+```
+
+Running `tformula` without arguments is equivalent to `tformula --shell`.
+
+## Markdown reader
+
+Pass a Markdown, text, or image path instead of a command to open TFormula's
+full-screen document reader:
+
+```sh
+tformula README.md
+tformula notes.txt
+tformula assets/tformula-maxwell.png
+```
+
+Known document extensions are detected automatically. Use `--read` to open
+another UTF-8 text file without making it ambiguous with a command:
+
+```sh
+tformula --read package.json
+```
+
+The reader parses Markdown into a document tree and lays it out again for the
+current terminal width. Markdown markers are hidden: headings, emphasis,
+quotes, nested lists, task items, fenced code, GFM tables, links, inline math,
+display math, and local images are displayed as document elements. Long table
+cells wrap vertically instead of losing their tails. Local PNG, JPEG, WebP,
+GIF, AVIF, TIFF, HEIF, and SVG files are converted to a terminal-ready PNG and
+keep their aspect ratio. An image is still drawn when a PDF/OCR converter has
+placed a caption or page header in the same paragraph.
+
+The open document and its referenced local images are watched for changes.
+Saving from an editor refreshes the rendered view automatically without
+restarting TFormula. Directory-based watching supports atomic-save editors;
+bursts of filesystem events are debounced, while the current viewport anchor
+and image zoom level are preserved across reloads.
+
+The reader recognizes `$...$`, `$$...$$`, `\(...\)`, and `\[...\]` math
+delimiters, including a `$$...$$` display equation written on one line. It also
+recovers standalone `[ ... ]` blocks when their contents contain unambiguous
+TeX such as `\sum`, `\frac`, or structured subscripts, without treating normal
+Markdown brackets as formulas.
+
+PDF/OCR exports often place display content on the delimiter line, concatenate
+two boundaries as `$$$$`, or attach a page header directly to a closing
+`$$`/`$`. Outside code spans and fences, the reader converts those boundaries
+to block-safe lines before CommonMark can swallow the rest of the document.
+HTML entities inside math, including matrix alignment `&amp;`, are decoded for
+MathJax. A paragraph containing only one single-dollar equation is displayed as
+block math when it is clearly standalone, optionally with an academic equation
+number such as `(4)` or a four-digit patent paragraph label.
+
+Inline formulas use a reader-specific tight-image path. After lazy MathJax
+measurement, TFormula creates a transparent PNG at the fitted glyph dimensions
+and places it at natural pixel size with Kitty `X`/`Y` sub-cell offsets. Width
+selection compares the neighboring floor and ceil terminal-column counts; the
+floor is used only when it requires no more than 8% additional proportional
+shrink. Adjacent Markdown space cells are replaced by the formula's pixel side
+bearing, CJK prose uses the remaining line width, and closing punctuation is
+kept off the start of the next line. Agent proxy overlays keep their original
+source masks and PTY coordinates; this tighter placement applies only to the
+document reader. Adjacent terminal prose still starts on integer cell
+boundaries, so this is not browser-style subpixel text layout, but tight PNGs,
+pixel offsets, and bounded fitting minimize the remaining quantization gap.
+
+Useful reader keys:
+
+| Key | Action |
+|---|---|
+| `j` / `k`, arrows | Scroll one line |
+| `Space` / `b`, Page Down / Up | Scroll one page |
+| `g` / `G` | Go to the start / end |
+| `/`, `n` / `N` | Search, then find next / previous |
+| `t` | Open the table of contents |
+| `[` / `]` | Go to the previous / next heading |
+| `+` / `-` | Zoom document images in / out |
+| `0` | Reset images to automatic fit |
+| `Tab` / `Shift-Tab`, `Enter` | Select and open a link |
+| `h` / Left | Return to the previous local document |
+| `r` | Toggle rendered and Markdown source views |
+| `q` | Quit |
+
+Relative Markdown links and `#heading` fragments open inside the reader.
+HTTP links are identified but are not launched automatically. Remote and data
+images are likewise not fetched in this first release. On a terminal without
+Kitty graphics, all text formatting remains available; formulas fall back to
+TeX and images to labeled placeholders.
+
+At 100%, each local image is automatically fitted to the document width and
+the current viewport while preserving its aspect ratio. Zoom is relative to
+that fitted size. A magnified image may span several screens; scrolling shows
+the corresponding image slice instead of hiding the image until it fits
+entirely in the viewport.
+
+Reader startup probes the terminal while loading the document in parallel.
+Markdown text is committed before uncached graphics, formulas are measured and
+rasterized only when they enter the viewport, and the semantic viewport anchor
+is preserved when measured formula widths replace conservative estimates.
+Rapid key input is coalesced to the newest frame. An image is normalized and
+uploaded once; zooming and cross-screen scrolling reuse that terminal image
+with source rectangles.
+
+## Formula history and export
+
+Formulas successfully rendered in wrapped Agent sessions are saved to local
+history. Identical formulas are recorded once per Agent session, so terminal
+resize, graphics retries, and repeated Agent output do not create duplicate
+entries. List recent formulas with:
+
+```sh
+tformula history
+tformula history --limit 50
+tformula history --json
+```
+
+The list includes a short ID that can be used as an export selector. The
+shortest workflow always acts on the latest formula:
+
+```sh
+tformula copy                 # raw LaTeX -> clipboard
+tformula copy mathml          # MathML -> clipboard
+tformula save formula.png     # high-resolution PNG
+tformula save formula.svg     # self-contained SVG
+```
+
+Use a full ID or unique prefix when the target is not the latest formula:
+
+```sh
+tformula copy 12ab34cd markdown
+tformula save 12ab34cd formula.mathml
+tformula save 12ab34cd formula.png --scale 6 --color navy --background white
+```
+
+The output extension selects the format for `save`; `--as <format>` can
+override it. The compatible `export` command remains available for scripts and
+stdout pipelines, for example `tformula export --last --format html`.
+
+| Format | `copy` / `--as` name | Output |
+|---|---|---|
+| Raw LaTeX | `latex` | Formula source plus newline |
+| Delimited LaTeX | `latex-inline`, `latex-display` | `\(...\)` or `\[...\]` |
+| Markdown | `markdown` | `$...$` or `$$...$$` according to formula layout |
+| MathML | `mathml` | Presentation MathML generated by MathJax |
+| HTML | `html` | MathML wrapped in a semantic `span` or `div` |
+| SVG | `svg` | Self-contained, transparent vector canvas |
+| PNG | `png` | Transparent 4x raster with 16 px padding by default |
+| TIFF | `tiff` | LZW-compressed high-resolution raster |
+
+Visual output is black on transparent by default. `--scale`, `--color`,
+`--background`, and `--padding` control SVG, PNG, and TIFF output. Everything
+is generated locally. On Linux, clipboard export uses `wl-copy` or `xclip`.
+
+History contains plaintext LaTeX, so its directory is restricted to mode
+`0700` and session files to `0600`. Use `--no-history` to disable recording,
+`tformula history --clear` to delete existing history, or
+`TFORMULA_HISTORY_DIR` to override its location.
+
+## Requirements
+
+- Ghostty recommended; Kitty, WezTerm, or another Kitty-graphics terminal
+- macOS or Linux
+- Node.js 20 or newer
+- The CLI agent you want to run
+
+The current implementation has been developed against Ghostty 1.3.1.
+
+## Install from this checkout
+
+```sh
+npm install
+npm run check
+npm link
+tformula codex
+```
+
+## Formula sizing
+
+### Transparent cmux backgrounds (local integration)
+
+`TFORMULA_TRANSPARENT=1` renders alpha PNGs and conceals the underlying source
+glyphs using terminal attributes, retaining their original copyable characters.
+The installed cmux launcher enables this mode by default. Rejected images and
+removed formulas restore visible source; subsequent input keeps its normal style.
+The startup cursor is queried so login banners do not offset formula coordinates.
+When positioning or unusual styling cannot be reproduced reliably, legacy opaque
+masks remain the fallback. Normal-buffer images remain with terminal scrollback.
+Set `TFORMULA_TRANSPARENT=0` before restarting the proxy for legacy behavior.
+
+The cmux launcher also defaults to `TFORMULA_STRICT=1`: only explicit math
+delimiters or complete math environments trigger rendering. Plain parentheses,
+identifiers, backtick code spans (including unfinished streamed spans), and code
+fences stay as text. Text following an inline formula is no longer packed into
+its image. If a TUI removes the delimiters, strict mode leaves that text alone.
+
+On synchronized TUI redraws, memory-cached formulas are placed before the
+application releases its frame. SSH/tmux fragments without frame controls are
+joined after a 16 ms quiet period (32 ms maximum, or 64 Ki characters). A pure
+frame-end control also waits for that short tail: tmux can close its frame in
+the middle of a formula and deliver the remainder unframed. Formula
+redraws use a synchronized transaction covering lifecycle deletes as well as
+image placement, so deleting old images cannot prematurely release source text.
+An in-flight render or a new layout gets up to 40 ms to finish before releasing
+the frame; slower work continues asynchronously. This improves scroll redraws
+without waiting indefinitely on typesetting; first-render latency is still possible.
+Run `npm run build && node benchmark/scroll-frames.mjs` to measure frame readiness.
+Set `TFORMULA_SCROLL_FRAGMENTED=1` for the unframed, fragmented redraw benchmark.
+Use `TFORMULA_SCROLL_FRAGMENTED=tmux` to test a frame ending in mid-formula.
+These local changes load in new terminal surfaces; reconnecting an existing SSH
+surface does not restart its outer renderer.
+
+At startup and after terminal resize events, TFormula queries the terminal for
+its cell dimensions in pixels. MathJax's natural `ex` dimensions are mapped to
+the terminal cell height, so an ordinary mathematical symbol has approximately
+the same visual size as neighboring terminal text. Fractions, sums, and other
+tall constructs retain their natural proportions.
+
+Formulas are never enlarged merely to fill the source rectangle. They are only
+scaled down when they would exceed the available safe visual canvas. This is
+necessary because inserting terminal rows behind a full-screen TUI would
+desynchronize its cursor coordinates.
+
+Formula scans are coalesced during streaming output instead of waiting for the
+terminal to become completely idle. Unrelated status-bar or spinner updates do
+not cancel formulas that remain unchanged on screen. Long PTY output bursts are
+forwarded at line-boundary checkpoints of roughly one third of the terminal
+height. TFormula completes a formula scan at each checkpoint before forwarding
+more rows, so rendered images enter scrollback together with their source text
+instead of being missed after an entire response scrolls past. When the terminal
+grid or cell pixel size changes, TFormula replaces only the affected Kitty
+placements.
+The underlying PNG is retained and shared by every placement with the same
+formula, size, and colors. Normal resizing only replaces images still in the
+live viewport; off-screen placements are preserved so the terminal can scroll
+and scale them with its own scrollback. Replacement is transactional: the old
+placement is deleted only after the new cached variant is ready, and xterm
+markers track its source rows through terminal reflow. A rapid sequence of font
+size changes therefore keeps the previous rendered formula instead of exposing
+the underlying TeX.
+
+Resize handling also preserves the terminal's pending-wrap state at the right
+margin. If a scan happens after reflow while the Agent is idle, TFormula
+restores the exact final grapheme and its ANSI rendition—including wide
+characters, colors, underline variants, and protected cells—without consuming
+the application's cursor-save slot. The next wrapped row therefore stays in
+sync with the real terminal, so display equations later in the viewport are not
+left behind as raw TeX. Regression coverage exercises narrow and wide grids,
+styled right-edge cells, CJK-width graphemes, and multi-block chemistry output.
+
+`CSI 2J` invalidates visible placements,
+while `CSI 3J` and `RIS` invalidate all placements and cached terminal images.
+TFormula reserves a private image-ID range and deletes that complete range on
+full reset and shutdown, including interrupted transmissions.
+
+When an agent emits display math as a single standalone `$$...$$` or
+`\[...\]` line, TFormula scores the source-only canvas and every candidate that
+borrows unambiguous adjacent blank rows. Simple equations stay on their source
+row; fractions, derivatives, large operators, and row environments use extra
+height when its readability gain outweighs borrowing and displacement costs.
+The chosen visual canvas remains transparent: an opaque background masks only
+the cells containing the original TeX. Inline math and display delimiters mixed
+with prose are never expanded, and a blank row shared by two standalone
+displays is assigned to neither.
+
+A trailing inline formula can similarly use one following blank row for tall
+fraction content. TFormula absorbs terminal punctuation into that overlay so it
+stays next to the rendered expression. Valid TeX is passed to MathJax without
+algebraic rewrites, so forms such as `1/\sqrt{...}`, superscripts, and unit
+slashes retain exactly the semantics emitted by the child program.
+
+When TeX soft-wraps at the terminal edge, or a terminal TUI inserts hard rows at
+its own content width, TFormula reassembles the expression and paints it through
+transparent per-row slices. Text sharing the first or last physical row remains
+visible. Inline glyphs are left-aligned with the source span so they stay next
+to preceding prose. Standalone display equations use the full terminal width;
+embedded display equations are centered inside the safe geometric interval
+between their prefix and suffix, so equations with different TeX source lengths
+share one center line. For inline content, the layout layer generically composes
+formula tokens and literal-text tokens from the first formula to the line end.
+It does not interpret the surrounding language. This moves otherwise
+unavoidable source-width padding to the harmless end of the line while the
+original terminal cells remain intact for copying and TUI cursor correctness.
+
+If a terminal does not answer pixel-size queries, TFormula falls back to 9x18
+pixels. You can override that explicitly:
+
+```sh
+tformula --cell-size 10x20 claude
+```
+
+The default text-relative scale is 1.0. It can be adjusted without changing the
+terminal font:
+
+```sh
+tformula --scale 1.1 codex
+TFORMULA_SCALE=0.9 tformula --shell
+```
+
+TFormula also measures how much a formula had to be reduced to fit its safe
+canvas. The default minimum readable ratio is 0.4; below it, the original TeX
+is kept instead of placing an illegibly small image. This policy can be tuned
+or disabled with zero:
+
+```sh
+tformula --min-readable-scale 0.6 codex
+TFORMULA_MIN_READABLE_SCALE=0 tformula claude
+```
+
+Background scans also require a newly detected formula region to remain
+unchanged for 80 ms before uploading it. A rapidly rewritten `x=1` → `x=2`
+region therefore renders only its final state. Output checkpoints bypass this
+quiet period for complete formulas so long responses cannot scroll them away.
+The delay can be adjusted or disabled:
+
+```sh
+tformula --stability-ms 150 codex
+TFORMULA_STABILITY_MS=0 tformula claude
+```
+
+Press `Ctrl-]` to open the most recently observed formula in a full-terminal,
+high-z-index focus overlay. While focused, `n`/`j` selects an older formula,
+`p`/`k` selects a newer formula, and `q`, `Esc`, or `Ctrl-]` closes the overlay.
+These keys are consumed by TFormula and never reach the Agent. The shortcut can
+be changed or disabled:
+
+```sh
+tformula --focus-key ctrl-f codex
+TFORMULA_FOCUS_KEY=none tformula claude
+```
+
+## Agent prompt template
+
+TFormula needs no agent-side configuration. If you also want the agent to emit
+math in the form that is easiest to detect—explicit `\(...\)` and `\[...\]`
+delimiters, prose kept outside math mode, TeX fragments without a preamble—an
+optional prompt template is available:
+
+[`docs/agent-prompt-template.md`](docs/agent-prompt-template.md)
+([简体中文](docs/agent-prompt-template.zh-CN.md))
+
+Copy it into `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, or your agent's custom
+instructions. The template was contributed by
+[@CHENyiru3](https://github.com/CHENyiru3) from an instruction set already in
+daily use with TFormula.
+
+## Scientific LaTeX compatibility
+
+TFormula uses a fixed, local MathJax profile aimed at formulas emitted by
+scientific CLI agents. In addition to core TeX and AMS notation, it enables
+`mhchem`, `physics`, `mathtools`, `cancel`, `centernot`, `upgreek`, `units`,
+`gensymb`, `cases`, `extpfeil`, `boldsymbol`, and `enclose`. This covers common
+mathematics, mechanics, electromagnetism, quantum notation, chemical equations
+and isotopes, kinetics, population genetics, biostatistics, annotated arrows,
+left scripts, and equation tags.
+
+Common local SI notation is also accepted, including `\SI{...}{...}`,
+`\si{...}`, and the unambiguous siunitx-v3 form `\qty{value}{unit}`. Physics
+forms such as `\qty(...)` are left untouched. TFormula does not attempt to
+emulate a full LaTeX installation: document-level or drawing systems such as
+TikZ, `chemfig`, and external images are an explicit boundary. If a command is
+unsupported, the renderer reports that command and leaves the original TeX
+visible instead of silently changing its meaning.
+
+Optional process-local customization is available for specialist notation and
+Unicode fallback fonts:
+
+```sh
+TFORMULA_MATH_MACROS='{"RR":"\\mathbb{R}","vect":["\\mathbf{#1}",1]}' tformula codex
+TFORMULA_MATH_ENVIRONMENTS='{"braced":["\\left\\{","\\right\\}"]}' tformula claude
+TFORMULA_FONT_FILES='/path/math.ttf:/path/text.otf' tformula pi
+TFORMULA_SYSTEM_FONTS=false tformula codex
+```
+
+Macro and environment values are MathJax `configmacros` definitions. Leading
+backslashes in names are optional. Font paths use the platform path delimiter
+(`:` on macOS/Linux). Configuration is validated when TFormula starts,
+dangerous external-content commands remain disabled, and the complete
+configuration fingerprint participates in SVG/PNG cache keys.
+
+## Formula and reader image cache
+
+Math rendering is content-addressed and shared by every TFormula-wrapped Agent
+run for the current user. A normalized formula is typeset to SVG once. Each
+terminal-ready PNG variant is then rasterized once for its exact display mode,
+cell dimensions, scale, foreground, background, and source rectangle. Reader
+inline variants cache their transparent fitted glyph PNG separately from Kitty
+placement, allowing one natural-size upload to be reused with sub-cell offsets.
+Returning to an earlier terminal font size reuses the existing PNG instead of
+invoking MathJax or the rasterizer again.
+
+Local reader images use the same bounded persistent cache. The cache key
+includes the source path, size, modification time, orientation-aware
+dimensions, and quantized terminal resolution. Reopening a document therefore
+reuses its terminal-ready PNG, while changing the source automatically selects
+a new entry. Reader-side terminal images also use an LRU budget so navigating
+through many documents does not grow terminal image storage without bound.
+
+Cache writes use per-item cross-process locks and atomic renames, so concurrent
+Agents can safely request the same formula. In-memory entries are bounded by
+both count and a 64 MB byte budget; the persistent cache retains its separate
+256 MB default budget. In a live terminal session, one PNG is uploaded once
+and reused by independent Kitty placements wherever the same
+variant appears. The original TeX text remains in terminal scrollback.
+
+On macOS the disk cache defaults to `~/Library/Caches/TFormula`; on Linux it
+uses `$XDG_CACHE_HOME/tformula` or `~/.cache/tformula`. Override the location or
+the default 256 MB limit with:
+
+```sh
+TFORMULA_CACHE_DIR=/path/to/cache tformula codex
+TFORMULA_CACHE_MAX_MB=512 tformula claude
+TFORMULA_READER_MAX_IMAGES=128 tformula README.md
+```
+
+Inspect or clear the formula cache without starting a PTY session:
+
+```sh
+tformula cache status
+tformula cache clear
+```
+
+## Detection
+
+TFormula recognizes these explicit forms:
+
+```text
+\[ ... \]
+$$ ... $$
+\( ... \)
+$ ... $
+\begin{equation} ... \end{equation}
+\begin{align} ... \end{align}
+```
+
+The standard equation, alignment, gather, cases, and matrix environments are
+recognized with or without surrounding dollar delimiters.
+
+Some agent TUIs consume the backslashes around `\[` and `\]` while rendering
+Markdown. For that case TFormula conservatively recognizes a bare `[`/`]`
+block only when its body contains strong TeX features such as `\frac`, `\sum`,
+subscripts, superscripts, or braced arguments.
+
+Those TUIs can also reduce TeX row separators from `\\` to `\` inside
+`aligned`, `gathered`, `cases`, and related environments. TFormula restores
+them only when the surrounding environment and direct loss evidence make the
+repair unambiguous, including row-spacing forms such as `\\[2pt]`. A recovered
+standalone display reserves the complete terminal width, so long scientific
+derivations are not compressed into the one-column closing `]` line.
+
+The same compatibility rule applies when a TUI turns inline delimiters such as
+`\(\rho\)` into `(\rho)`. TFormula renders the parenthesized span only when its
+contents contain a recognized TeX command or similarly strong math structure;
+ordinary prose in parentheses remains unchanged.
+
+Short equations such as `E=mc^2`, `p=0`, and `c^2` are also recognized from
+their operator structure. A single letter is inferred only in a symbol
+definition item, where forms such as `- (E)：energy` are unambiguous.
+
+Consecutive definition items such as `- (\rho)：电荷密度` are rendered as one
+compact two-column MathJax array. This keeps symbols, colons, and descriptions
+aligned even though their original TeX source strings have different widths.
+Math expressions embedded in a description, including units written with
+`\text{...}`, remain mathematical content inside that array.
+
+Single-dollar expressions also require mathematical structure, which prevents
+ordinary prices such as `$12.50` from being rendered.
+
+## Options
+
+```text
+--shell                 Start the login shell
+--read <path>           Open a Markdown, text, or image file
+--no-math               Run only as a transparent PTY proxy
+--no-history            Do not persist successfully rendered formulas
+--scale <number>        Formula-to-terminal text scale (0.5 to 2.0)
+--min-readable-scale <n> Keep raw TeX below this fitted ratio (0 to 1)
+--stability-ms <number> Background formula quiet period (0 to 2000 ms)
+--focus-key <key>       Formula focus shortcut (ctrl-X, one character, or none)
+--cell-size <WxH>       Override terminal cell pixels
+-C, --cwd <directory>  Child working directory
+--debug                 Print detection and sizing diagnostics
+```
+
+Use `--` when an agent command or its arguments could be mistaken for TFormula
+options:
+
+```sh
+tformula -- claude --resume
+```
+
+## Safety and fallback behavior
+
+- MathJax and fonts are installed locally; rendering does not use a CDN.
+- Formula length and MathJax's internal input buffer are limited to 20,000 characters;
+  macro/environment expansion is limited to 1,000 substitutions.
+- Commands that can load or embed external content, including `\require`,
+  `\href`, `\url`, `\includegraphics`, `\input`, `\include`, `\usepackage`,
+  `\documentclass`, and MathJax HTML/style commands, are rejected.
+- Generated rasters are limited to 8192 pixels per side, 4096² total pixels,
+  and 12 MB PNG payloads. Wide Retina terminal overlays fit within this budget;
+  empty rasters are rejected with structured diagnostics. Resvg runs in a
+  restartable isolated process, so a native rasterizer panic cannot terminate
+  the Agent or PTY session.
+- A parse or render failure leaves the original LaTeX visible.
+- Rendering is source-preserving: TFormula never replaces child text with a
+  raster. Formula images are independent overlays, so the terminal buffer,
+  scrollback, copied text, and Agent-visible coordinates retain the original
+  TeX. The detector treats fenced/inline code, HTML `code`/`pre` spans, TeX
+  `\verb` spans, and TeX comment tails as literal text.
+- On terminals without Kitty graphics support, TFormula remains a transparent
+  PTY proxy. The document reader retains its ANSI text layout and uses readable
+  formula and image placeholders.
+- Reader HTML is treated as text; it is not executed. Reader images are loaded
+  only from local files in this release.
+
+The full feature-by-feature comparison with pi-math, including deliberate PTY
+architecture boundaries, is recorded in [`docs/pi-math-parity.md`](docs/pi-math-parity.md).
+
+## Development
+
+```sh
+npm run build
+npm test
+npm run check
+```
+
+The test suite covers delimiter inference, false-positive filtering, Unicode
+column positions, terminal response parsing, text-relative geometry, Kitty
+encoding, MathJax-to-PNG rendering, Markdown parsing and layout, and generic
+command wrapping.
+
+For an end-to-end diagnostic, add `--debug`. A successful render reports the
+terminal cell size, source location, and generated pixel rectangle without
+printing the formula image bytes.
