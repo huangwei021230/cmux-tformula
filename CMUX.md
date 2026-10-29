@@ -15,15 +15,24 @@ TFormula sits on the local PTY. cmux terminals, including managed SSH sessions, 
 
 ## Install
 
-From a checkout, one command builds TFormula and hooks new cmux terminals:
+From a checkout:
 
 ```sh
 ./cmux/install.sh
 ```
 
-Interactive zsh loads the wrapper from `~/.zshrc`. cmux-managed SSH loads it through `BASH_ENV` before the remote command starts. Open a new cmux terminal afterward. A terminal that is already open keeps its current shell.
+Node.js 20 or newer and npm must already be on `PATH`. The installer does not search the home directory, read SSH keys, or send data anywhere. It writes only this account's launcher and shell hooks.
 
-`./cmux/install.sh --uninstall` removes those hooks. `CMUX_FORMULA_DISABLE=1`, or a file at `~/.config/tformula/disabled`, turns rendering off without uninstalling.
+What it changes:
+
+- `~/.local/bin/tformula`, only when that file is absent or was created by this installer. `--force` is required to replace a different `tformula`.
+- The login shell's startup file (`~/.zshrc` or `~/.bashrc`). The hook runs only inside a local interactive cmux terminal.
+- `BASH_ENV` for cmux-managed SSH. If `BASH_ENV` already points at another file, that file is sourced first. Bash started outside cmux is unchanged.
+- On macOS, a per-user LaunchAgent so a Dock-launched cmux can see `BASH_ENV`. Quit and reopen cmux once after installing.
+
+Open a new cmux terminal afterward. A terminal that is already open keeps its current shell.
+
+`./cmux/install.sh --uninstall` removes the hooks and restores a previous `BASH_ENV` when one was saved. `CMUX_FORMULA_DISABLE=1`, or a file at `~/.config/tformula/disabled`, turns rendering off without uninstalling.
 
 ## Run from a checkout
 
