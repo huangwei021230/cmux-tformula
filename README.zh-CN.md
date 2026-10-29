@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-这个仓库发布的是基于 [TFormula](https://github.com/mikewang817/TFormula) 0.3.1 的 cmux 中间层（MIT，版权归 Mike Wang）。它在 cmux 里把 LaTeX 渲染成透明图片，包括 cmux 管理的 SSH 会话。安装说明见 [CMUX.md](CMUX.md)。
+这个仓库发布的是基于 [TFormula](https://github.com/mikewang817/TFormula) 0.3.1 的 cmux 中间层（MIT，版权归 Mike Wang）。它在 cmux 里把 LaTeX 渲染成透明图片，包括 cmux 管理的 SSH 会话。在仓库里运行 `./cmux/install.sh` 即可接入新的 cmux 终端，说明见 [CMUX.md](CMUX.md)。
 
 直接在终端中渲染 **OpenAI Codex** 以及其他 CLI Agent 实时输出的科学公式，
 同时保持终端原有的完整交互能力。

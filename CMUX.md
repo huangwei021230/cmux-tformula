@@ -13,7 +13,19 @@ TFormula sits on the local PTY. cmux terminals, including managed SSH sessions, 
 
 `patches/cmux-integration.patch` is the same work as a diff against upstream `008265f`.
 
-## Run
+## Install
+
+From a checkout, one command builds TFormula and hooks new cmux terminals:
+
+```sh
+./cmux/install.sh
+```
+
+Interactive zsh loads the wrapper from `~/.zshrc`. cmux-managed SSH loads it through `BASH_ENV` before the remote command starts. Open a new cmux terminal afterward. A terminal that is already open keeps its current shell.
+
+`./cmux/install.sh --uninstall` removes those hooks. `CMUX_FORMULA_DISABLE=1`, or a file at `~/.config/tformula/disabled`, turns rendering off without uninstalling.
+
+## Run from a checkout
 
 ```sh
 npm install

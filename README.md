@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-This repository publishes a cmux middleware built on [TFormula](https://github.com/mikewang817/TFormula) 0.3.1 (MIT, copyright Mike Wang). It renders LaTeX as transparent images inside cmux, including cmux-managed SSH. Setup is in [CMUX.md](CMUX.md).
+This repository publishes a cmux middleware built on [TFormula](https://github.com/mikewang817/TFormula) 0.3.1 (MIT, copyright Mike Wang). It renders LaTeX as transparent images inside cmux, including cmux-managed SSH. Run `./cmux/install.sh` to hook new cmux terminals. Details are in [CMUX.md](CMUX.md).
 
 Render scientific LaTeX directly inside **OpenAI Codex** and any other CLI
 agent, while keeping the terminal fully interactive.
